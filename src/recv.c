@@ -16,14 +16,13 @@
 #include "tracing.h"
 
 /* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 /* Dispatch a single RPC message to the appropriate handler. */
-static int recvMessage(struct raft *r, struct raft_message *message)
+int recvMessage(struct raft *r,
+                raft_id id,
+                const char *address,
+                struct raft_message *message)
 {
     int rv = 0;
 
@@ -38,36 +37,35 @@ static int recvMessage(struct raft *r, struct raft_message *message)
 
     switch (message->type) {
         case RAFT_IO_APPEND_ENTRIES:
-            rv = recvAppendEntries(r, message->server_id,
-                                   message->server_address,
-                                   &message->append_entries);
+            rv = recvAppendEntries(r, id, address, &message->append_entries);
             if (rv != 0) {
                 entryBatchesDestroy(message->append_entries.entries,
                                     message->append_entries.n_entries);
             }
             break;
         case RAFT_IO_APPEND_ENTRIES_RESULT:
-            rv = recvAppendEntriesResult(r, message->server_id,
-                                         message->server_address,
+            rv = recvAppendEntriesResult(r, id, address,
                                          &message->append_entries_result);
             break;
         case RAFT_IO_REQUEST_VOTE:
-            rv = recvRequestVote(r, message->server_id, message->server_address,
-                                 &message->request_vote);
+            rv = recvRequestVote(r, id, address, &message->request_vote);
             break;
         case RAFT_IO_REQUEST_VOTE_RESULT:
-            rv = recvRequestVoteResult(r, message->server_id,
-                                       message->server_address,
+            rv = recvRequestVoteResult(r, id, address,
                                        &message->request_vote_result);
             break;
         case RAFT_IO_INSTALL_SNAPSHOT:
+            /*
             rv = recvInstallSnapshot(r, message->server_id,
                                      message->server_address,
                                      &message->install_snapshot);
+            */
             break;
         case RAFT_IO_TIMEOUT_NOW:
+            /*
             rv = recvTimeoutNow(r, message->server_id, message->server_address,
                                 &message->timeout_now);
+            */
             break;
     };
 
@@ -79,15 +77,18 @@ static int recvMessage(struct raft *r, struct raft_message *message)
 
     /* If there's a leadership transfer in progress, check if it has
      * completed. */
+    /*
     if (r->transfer != NULL) {
         if (r->follower_state.current_leader.id == r->transfer->id) {
             membershipLeadershipTransferClose(r);
         }
     }
+    */
 
     return 0;
 }
 
+/*
 void recvCb(struct raft_io *io, struct raft_message *message)
 {
     struct raft *r = io->data;
@@ -110,35 +111,42 @@ void recvCb(struct raft_io *io, struct raft_message *message)
         convertToUnavailable(r);
     }
 }
+*/
 
 int recvBumpCurrentTerm(struct raft *r, raft_term term)
 {
+    /*
     int rv;
     char msg[128];
+    */
 
     assert(r != NULL);
     assert(term > r->current_term);
 
+    /*
     sprintf(msg, "remote term %lld is higher than %lld -> bump local term",
             term, r->current_term);
     if (r->state != RAFT_FOLLOWER) {
         strcat(msg, " and step down");
     }
     tracef("%s", msg);
+    */
 
     /* Save the new term to persistent store, resetting the vote. */
+    /*
     rv = r->io->set_term(r->io, term);
     if (rv != 0) {
         return rv;
     }
+    */
 
     /* Update our cache too. */
     r->current_term = term;
     r->voted_for = 0;
 
     if (r->state != RAFT_FOLLOWER) {
-        /* Also convert to follower. */
-        convertToFollower(r);
+      /* Also convert to follower. */
+      convertToFollower(r);
     }
 
     return 0;
@@ -182,7 +190,14 @@ int recvEnsureMatchingTerms(struct raft *r, raft_term term, int *match)
      *   If a candidate or leader discovers that its term is out of date, it
      *   immediately reverts to follower state.
      */
-    if (*match == 1) {
+    if (term > r->current_term) {
+        char msg[128];
+        sprintf(msg, "remote term is higher (%lld vs %lld) -> bump term", term,
+                r->current_term);
+        if (r->state != RAFT_FOLLOWER) {
+            strcat(msg, ", step down");
+        }
+        tracef("%s", msg);
         rv = recvBumpCurrentTerm(r, term);
         if (rv != 0) {
             return rv;
