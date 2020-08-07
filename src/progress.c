@@ -108,7 +108,7 @@ bool progressIsUpToDate(struct raft *r, unsigned i)
 bool progressShouldReplicate(struct raft *r, unsigned i)
 {
     struct raft_progress *p = &r->leader_state.progress[i];
-    raft_time now = r->io->time(r->io);
+    raft_time now = r->clock->now(r->clock);
     bool needs_heartbeat = now - p->last_send >= r->heartbeat_timeout;
     raft_index last_index = logLastIndex(&r->log);
     bool result = false;
@@ -154,7 +154,7 @@ raft_index progressMatchIndex(struct raft *r, unsigned i)
 
 void progressUpdateLastSend(struct raft *r, unsigned i)
 {
-    r->leader_state.progress[i].last_send = r->io->time(r->io);
+    r->leader_state.progress[i].last_send = r->clock->now(r->clock);
 }
 
 bool progressResetRecentRecv(struct raft *r, const unsigned i)
