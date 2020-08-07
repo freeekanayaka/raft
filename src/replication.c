@@ -8,6 +8,7 @@
 #endif
 #include "err.h"
 #include "heap.h"
+#include "io.h"
 #include "log.h"
 #include "membership.h"
 #include "progress.h"
@@ -17,12 +18,7 @@
 #include "snapshot.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 #ifndef max
 #define max(a, b) ((a) < (b) ? (b) : (a))
@@ -45,16 +41,15 @@ struct sendAppendEntries
 };
 
 /* Callback invoked after request to send an AppendEntries RPC has completed. */
-static void sendAppendEntriesCb(struct raft_io_send *send, const int status)
+void replicationSendAppendEntriesDone(struct raft *r,
+                                      struct raft_send_message *send,
+                                      const int status)
 {
-    struct sendAppendEntries *req = send->data;
-    struct raft *r = req->raft;
-    unsigned i = configurationIndexOf(&r->configuration, req->server_id);
+    struct raft_append_entries *append = &send->message.append_entries;
+    unsigned i = configurationIndexOf(&r->configuration, send->id);
 
     if (r->state == RAFT_LEADER && i < r->configuration.n) {
         if (status != 0) {
-            tracef("failed to send append entries to server %u: %s",
-                   req->server_id, raft_strerror(status));
             /* Go back to probe mode. */
             progressToProbe(r, i);
         } else {
@@ -73,8 +68,8 @@ static void sendAppendEntriesCb(struct raft_io_send *send, const int status)
     }
 
     /* Tell the log that we're done referencing these entries. */
-    logRelease(&r->log, req->index, req->entries, req->n);
-    raft_free(req);
+    logRelease(&r->log, append->prev_log_index + 1, append->entries,
+               append->n_entries);
 }
 
 /* Send an AppendEntries message to the i'th server, including all log entries
@@ -87,8 +82,8 @@ static int sendAppendEntries(struct raft *r,
     struct raft_server *server = &r->configuration.servers[i];
     struct raft_message message;
     struct raft_append_entries *args = &message.append_entries;
-    struct sendAppendEntries *req;
     raft_index next_index = prev_index + 1;
+    const char *progress_state;
     int rv;
 
     args->term = r->current_term;
@@ -111,40 +106,39 @@ static int sendAppendEntries(struct raft *r,
      */
     args->leader_commit = r->commit_index;
 
-    tracef("send %u entries starting at %llu to server %u (last index %llu)",
-           args->n_entries, args->prev_log_index, server->id,
-           logLastIndex(&r->log));
+    switch (progressState(r, i)) {
+        case PROGRESS__PROBE:
+            progress_state = "probe";
+            break;
+        case PROGRESS__PIPELINE:
+            progress_state = "pipeline";
+            break;
+        default:
+            /* We should be called only for probe or pipeline */
+            assert(0);
+            progress_state = NULL;
+            break;
+    }
+
+    tracef("%s server %llu sending %u entries with first index %llu",
+           progress_state, server->id, args->n_entries,
+           args->prev_log_index + 1);
 
     message.type = RAFT_IO_APPEND_ENTRIES;
-    message.server_id = server->id;
-    message.server_address = server->address;
 
-    req = raft_malloc(sizeof *req);
-    if (req == NULL) {
-        rv = RAFT_NOMEM;
-        goto err_after_entries_acquired;
-    }
-    req->raft = r;
-    req->index = args->prev_log_index + 1;
-    req->entries = args->entries;
-    req->n = args->n_entries;
-    req->server_id = server->id;
-
-    req->send.data = req;
-    rv = r->io->send(r->io, &req->send, &message, sendAppendEntriesCb);
+    rv = ioSendMessage(r, server->id, server->address, message);
     if (rv != 0) {
-        goto err_after_req_alloc;
+        goto err_after_entries_acquired;
     }
 
     if (progressState(r, i) == PROGRESS__PIPELINE) {
         /* Optimitiscally update progress. */
-        progressOptimisticNextIndex(r, i, req->index + req->n);
+        progressOptimisticNextIndex(r, i,
+                                    args->prev_log_index + 1 + args->n_entries);
     }
 
     return 0;
 
-err_after_req_alloc:
-    raft_free(req);
 err_after_entries_acquired:
     logRelease(&r->log, next_index, args->entries, args->n_entries);
 err:
@@ -163,26 +157,22 @@ struct sendInstallSnapshot
     raft_id server_id;               /* Destination server. */
 };
 
-static void sendInstallSnapshotCb(struct raft_io_send *send, int status)
+void replicationSendInstallSnapshotDone(struct raft *r,
+                                        struct raft_send_message *send,
+                                        int status)
 {
-    struct sendInstallSnapshot *req = send->data;
-    struct raft *r = req->raft;
     const struct raft_server *server;
 
-    server = configurationGet(&r->configuration, req->server_id);
+    server = configurationGet(&r->configuration, send->id);
 
     if (status != 0) {
         tracef("send install snapshot: %s", raft_strerror(status));
         if (r->state == RAFT_LEADER && server != NULL) {
             unsigned i;
-            i = configurationIndexOf(&r->configuration, req->server_id);
+            i = configurationIndexOf(&r->configuration, send->id);
             progressAbortSnapshot(r, i);
         }
     }
-
-    snapshotClose(req->snapshot);
-    raft_free(req->snapshot);
-    raft_free(req);
 }
 
 static void sendSnapshotGetCb(struct raft_io_snapshot_get *get,
@@ -221,26 +211,29 @@ static void sendSnapshotGetCb(struct raft_io_snapshot_get *get,
         goto abort_with_snapshot;
     }
 
-    assert(snapshot->n_bufs == 1);
-
     message.type = RAFT_IO_INSTALL_SNAPSHOT;
+    /*
     message.server_id = server->id;
     message.server_address = server->address;
+    */
 
     args->term = r->current_term;
+    /*
     args->last_index = snapshot->index;
     args->last_term = snapshot->term;
     args->conf_index = snapshot->configuration_index;
     args->conf = snapshot->configuration;
-    args->data = snapshot->bufs[0];
+    */
+    args->data = snapshot->data;
 
     req->snapshot = snapshot;
     req->send.data = req;
 
-    tracef("sending snapshot with last index %llu to %u", snapshot->index,
-           server->id);
+    /* tracef("sending snapshot with last index %llu to %u", snapshot->index, */
+    /*        server->id); */
 
-    rv = r->io->send(r->io, &req->send, &message, sendInstallSnapshotCb);
+    /* rv = r->io->send(r->io, &req->send, &message, sendInstallSnapshotCb); */
+    rv = 0;
     if (rv != 0) {
         goto abort_with_snapshot;
     }
@@ -264,32 +257,25 @@ out:
 static int sendSnapshot(struct raft *r, const unsigned i)
 {
     struct raft_server *server = &r->configuration.servers[i];
-    struct sendInstallSnapshot *request;
+    struct raft_message message;
+    struct raft_install_snapshot *args = &message.install_snapshot;
     int rv;
 
     progressToSnapshot(r, i);
 
-    request = raft_malloc(sizeof *request);
-    if (request == NULL) {
-        rv = RAFT_NOMEM;
-        goto err;
-    }
-    request->raft = r;
-    request->server_id = server->id;
-    request->get.data = request;
+    message.type = RAFT_IO_INSTALL_SNAPSHOT;
 
-    /* TODO: make sure that the I/O implementation really returns the latest
-     * snapshot *at this time* and not any snapshot that might be stored at a
-     * later point. Otherwise the progress snapshot_index would be wrong. */
-    rv = r->io->snapshot_get(r->io, &request->get, sendSnapshotGetCb);
+    args->term = r->current_term;
+    args->last_index = logSnapshotIndex(&r->log);
+    args->last_term = logSnapshotTerm(&r->log);
+
+    rv = ioSendMessage(r, server->id, server->address, message);
     if (rv != 0) {
-        goto err_after_req_alloc;
+        goto err;
     }
 
     return 0;
 
-err_after_req_alloc:
-    raft_free(request);
 err:
     progressAbortSnapshot(r, i);
     assert(rv != 0);
@@ -307,10 +293,6 @@ int replicationProgress(struct raft *r, unsigned i)
     assert(r->state == RAFT_LEADER);
     assert(server->id != r->id);
     assert(next_index >= 1);
-
-    if (!progressShouldReplicate(r, i)) {
-        return 0;
-    }
 
     /* From Section 3.5:
      *
@@ -332,6 +314,8 @@ int replicationProgress(struct raft *r, unsigned i)
         if (snapshot_index > 0) {
             raft_index last_index = logLastIndex(&r->log);
             assert(last_index > 0); /* The log can't be empty */
+            tracef("catch-up server %llu sending snapshot for missing index 1",
+                   server->id);
             goto send_snapshot;
         }
         prev_index = 0;
@@ -344,7 +328,9 @@ int replicationProgress(struct raft *r, unsigned i)
         /* If the entry is not anymore in our log, send the last snapshot. */
         if (prev_term == 0) {
             assert(prev_index < snapshot_index);
-            tracef("missing entry at index %lld -> send snapshot", prev_index);
+            tracef(
+                "catch-up server %llu sending snapshot for missing index %llu",
+                server->id, prev_index);
             goto send_snapshot;
         }
     }
@@ -378,20 +364,18 @@ static int triggerAll(struct raft *r)
             server->id != r->leader_state.promotee_id) {
             continue;
         }
+        if (!progressShouldReplicate(r, i)) {
+            continue;
+        }
         rv = replicationProgress(r, i);
-        if (rv != 0 && rv != RAFT_NOCONNECTION) {
+        if (rv != 0) {
             /* This is not a critical failure, let's just log it. */
-            tracef("failed to send append entries to server %u: %s (%d)",
+            tracef("failed to send append entries to server %llu: %s (%d)",
                    server->id, raft_strerror(rv), rv);
         }
     }
 
     return 0;
-}
-
-int replicationHeartbeat(struct raft *r)
-{
-    return triggerAll(r);
 }
 
 /* Context for a write log entries request that was submitted by a leader. */
@@ -404,7 +388,7 @@ struct appendLeader
     struct raft_io_append req;
 };
 
-/* Called after a successful append entries I/O request to update the index of
+/* Called after a successful persist entries I/O request to update the index of
  * the last entry stored on disk. Return how many new entries that are still
  * present in our in-memory log were stored. */
 static size_t updateLastStored(struct raft *r,
@@ -459,40 +443,57 @@ static struct request *getRequest(struct raft *r,
     return NULL;
 }
 
-/* Invoked once a disk write request for new entries has been completed. */
-static void appendLeaderCb(struct raft_io_append *req, int status)
+/* Invoked when a follower has persisted a new set of log entries. We
+ * immediately apply any configuration change contained in the persisted
+ * entries. */
+static int followerHandlePersistedEntries(struct raft *r,
+                                          raft_index first_index,
+                                          struct raft_entry *entries,
+                                          size_t n)
 {
-    struct appendLeader *request = req->data;
-    struct raft *r = request->raft;
-    size_t server_index;
+    size_t i;
     int rv;
 
-    tracef("leader: written %u entries starting at %lld: status %d", request->n,
-           request->index, status);
+    /* Possibly apply configuration changes as uncommitted. */
+    for (i = 0; i < n; i++) {
+        struct raft_entry *entry = &entries[i];
+        raft_index index = first_index + i;
+        raft_term local_term = logTermOf(&r->log, index);
 
-    /* In case of a failed disk write, if we were the leader creating these
-     * entries in the first place, truncate our log too (since we have appended
-     * these entries to it) and fire the request callback. */
-    if (status != 0) {
-        struct raft_apply *apply;
-        ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
-        apply =
-            (struct raft_apply *)getRequest(r, request->index, RAFT_COMMAND);
-        if (apply != NULL) {
-            if (apply->cb != NULL) {
-                apply->cb(apply, status, NULL);
+        assert(local_term != 0 && local_term == entry->term);
+
+        if (entry->type == RAFT_CHANGE) {
+            rv = membershipUncommittedChange(r, index, entry);
+            if (rv != 0) {
+                return rv;
             }
         }
-        goto out;
     }
 
-    updateLastStored(r, request->index, request->entries, request->n);
-
-    /* If we are not leader anymore, just discard the result. */
-    if (r->state != RAFT_LEADER) {
-        tracef("local server is not leader -> ignore write log result");
-        goto out;
+    /* From Figure 3.1:
+     *
+     *   AppendEntries RPC: Receiver implementation: If leaderCommit >
+     *   commitIndex, set commitIndex = min(leaderCommit, index of last
+     *   new entry).
+     */
+    if (r->follower_state.current_leader.commit_index > r->commit_index) {
+        r->commit_index =
+            min(r->follower_state.current_leader.commit_index, r->last_stored);
+        rv = replicationApply(r);
+        if (rv != 0) {
+            return rv;
+        }
     }
+
+    return 0;
+}
+
+static void replicationCheckQuorum(struct raft *r, raft_index index);
+
+static int leaderHandlePersistedEntries(struct raft *r)
+{
+    size_t server_index;
+    int rv;
 
     /* If Check if we have reached a quorum. */
     server_index = configurationIndexOf(&r->configuration, r->id);
@@ -515,20 +516,124 @@ static void appendLeaderCb(struct raft_io_append *req, int status)
     }
 
     /* Check if we can commit some new entries. */
-    replicationQuorum(r, r->last_stored);
+    replicationCheckQuorum(r, r->last_stored);
 
     rv = replicationApply(r);
     if (rv != 0) {
-        /* TODO: just log the error? */
+        return rv;
+    }
+
+    return 0;
+}
+
+static void sendAppendEntriesResult(
+    struct raft *r,
+    const struct raft_append_entries_result *result)
+{
+    struct raft_message message;
+    raft_id id = r->follower_state.current_leader.id;
+    const char *address = r->follower_state.current_leader.address;
+
+    /* TODO: is there actually a possibility that no leader is set? */
+    if (id == 0) {
+        return;
+    }
+
+    message.type = RAFT_IO_APPEND_ENTRIES_RESULT;
+    /*
+    message.server_id = r->follower_state.current_leader.id;
+    message.server_address = r->follower_state.current_leader.address;
+    */
+    message.append_entries_result = *result;
+
+    if (result->rejected == 0) {
+        tracef("replicated index %llu -> send success result to %llu",
+               result->last_log_index, id);
+    }
+
+    /* Ignore errors since they're not fatal. We'll retry. */
+    ioSendMessage(r, id, address, message);
+}
+
+/* Invoked once a disk write request for new entries has been completed. */
+void replicationPersistEntriesDone(struct raft *r,
+                                   struct raft_persist_entries *persist,
+                                   int status)
+{
+    struct raft_append_entries_result result;
+    size_t n;
+    int rv;
+
+    /*
+    tracef("leader: written %u entries starting at %lld: status %d", request->n,
+           request->index, status);
+    */
+
+    if (r->state == RAFT_FOLLOWER) {
+        result.term = r->current_term;
+        result.rejected = persist->first_index;
+    }
+
+    /* In case of a failed disk write, if we were the leader creating these
+     * entries in the first place, truncate our log too (since we have appended
+     * these entries to it). */
+    if (status != 0) {
+        /*
+        struct raft_apply *apply;
+        ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
+        apply =
+            (struct raft_apply *)getRequest(r, request->index, RAFT_COMMAND);
+        if (apply != NULL) {
+            if (apply->cb != NULL) {
+                apply->cb(apply, status, NULL);
+            }
+        }
+        */
+        goto out;
+    }
+
+    n = updateLastStored(r, persist->first_index, persist->entries, persist->n);
+    assert(n <= persist->n);
+
+    /* If none of the entries that we persisted is present anymore in our
+     * in-memory log, there's nothing to report or to do. We just discard
+     * them. */
+    if (n == 0) {
+        goto out;
+    }
+
+    switch (r->state) {
+        case RAFT_FOLLOWER:
+            rv = followerHandlePersistedEntries(r, persist->first_index,
+                                                persist->entries, n);
+            if (rv != 0) {
+                goto out;
+            }
+            result.rejected = 0;
+            break;
+        case RAFT_LEADER:
+            rv = leaderHandlePersistedEntries(r);
+            if (rv != 0) {
+                /* TODO: just log the error? */
+            }
+            break;
     }
 
 out:
     /* Tell the log that we're done referencing these entries. */
-    logRelease(&r->log, request->index, request->entries, request->n);
+    logRelease(&r->log, persist->first_index, persist->entries, persist->n);
+
+    /* If the write failed, let's remove all these entries from the log. */
     if (status != 0) {
-        logTruncate(&r->log, request->index);
+        if (persist->first_index >= logLastIndex(&r->log)) {
+            logTruncate(&r->log, persist->first_index);
+        }
     }
-    raft_free(request);
+
+    if (r->state == RAFT_FOLLOWER) {
+        result.last_log_index = r->last_stored;
+        sendAppendEntriesResult(r, &result);
+    }
 }
 
 /* Submit a disk write for all entries from the given index onward. */
@@ -536,7 +641,6 @@ static int appendLeader(struct raft *r, raft_index index)
 {
     struct raft_entry *entries;
     unsigned n;
-    struct appendLeader *request;
     int rv;
 
     assert(r->state == RAFT_LEADER);
@@ -553,33 +657,53 @@ static int appendLeader(struct raft *r, raft_index index)
      * some entries to write. */
     assert(n > 0);
 
-    /* Allocate a new request. */
-    request = raft_malloc(sizeof *request);
-    if (request == NULL) {
-        rv = RAFT_NOMEM;
-        goto err_after_entries_acquired;
-    }
-
-    request->raft = r;
-    request->index = index;
-    request->entries = entries;
-    request->n = n;
-    request->req.data = request;
-
-    rv = r->io->append(r->io, &request->req, entries, n, appendLeaderCb);
+    rv = ioPersistEntries(r, index, entries, n);
     if (rv != 0) {
-        ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
-        goto err_after_request_alloc;
+        goto err_after_entries_acquired;
     }
 
     return 0;
 
-err_after_request_alloc:
-    raft_free(request);
 err_after_entries_acquired:
     logRelease(&r->log, index, entries, n);
 err:
     assert(rv != 0);
+    return rv;
+}
+
+int replicationHeartbeat(struct raft *r, bool initial)
+{
+    int rv;
+
+    /* If this is the very first heartbeat, also replicate a blank no-op
+     * entry. */
+    if (initial) {
+        struct raft_buffer buf;
+        raft_index index;
+
+        /* TODO: use a completely empty buffer */
+        buf.len = 8;
+        buf.base = HeapMalloc(buf.len);
+        if (buf.base == NULL) {
+            goto trigger;
+        }
+
+        rv = logAppend(&r->log, r->current_term, RAFT_BARRIER, &buf, NULL);
+        if (rv != 0) {
+            HeapFree(buf.base);
+            goto trigger;
+        }
+
+        index = logLastIndex(&r->log);
+        rv = appendLeader(r, index);
+        if (rv != 0) {
+            logDiscard(&r->log, index);
+        }
+    }
+
+trigger:
+    rv = triggerAll(r);
+    r->clock->timeout(r->clock, r->heartbeat_timeout);
     return rv;
 }
 
@@ -661,6 +785,7 @@ int replicationUpdate(struct raft *r,
 {
     bool is_being_promoted;
     raft_index last_index;
+    bool made_progress;
     unsigned i;
     int rv;
 
@@ -686,7 +811,7 @@ int replicationUpdate(struct raft *r,
                                        result->last_log_index);
         if (retry) {
             /* Retry, ignoring errors. */
-            tracef("log mismatch -> send old entries to %u", server->id);
+            tracef("log mismatch -> send old entries to %llu", server->id);
             replicationProgress(r, i);
         }
         return 0;
@@ -708,9 +833,7 @@ int replicationUpdate(struct raft *r,
      *
      *   If successful update nextIndex and matchIndex for follower.
      */
-    if (!progressMaybeUpdate(r, i, last_index)) {
-        return 0;
-    }
+    made_progress = progressMaybeUpdate(r, i, last_index);
 
     switch (progressState(r, i)) {
         case PROGRESS__SNAPSHOT:
@@ -722,6 +845,10 @@ int replicationUpdate(struct raft *r,
         case PROGRESS__PROBE:
             /* Transition to pipeline */
             progressToPipeline(r, i);
+    }
+
+    if (!made_progress) {
+        return 0;
     }
 
     /* If the server is currently being promoted and is catching with logs,
@@ -740,7 +867,7 @@ int replicationUpdate(struct raft *r,
     }
 
     /* Check if we can commit some new entries. */
-    replicationQuorum(r, r->last_stored);
+    replicationCheckQuorum(r, progressMatchIndex(r, i));
 
     rv = replicationApply(r);
     if (rv != 0) {
@@ -760,53 +887,26 @@ int replicationUpdate(struct raft *r,
         /* If we are transfering leadership to this follower, check if its log
          * is now up-to-date and, if so, send it a TimeoutNow RPC (unless we
          * already did). */
-        if (r->transfer != NULL && r->transfer->id == server->id) {
-            if (progressIsUpToDate(r, i) && r->transfer->send.data == NULL) {
+        if (r->transfer.id != 0 && r->transfer.id == server->id) {
+            if (progressIsUpToDate(r, i) && !r->transfer.timeout_sent) {
+                tracef("server %llu caught up > send timeout now message",
+                       r->transfer.id);
                 rv = membershipLeadershipTransferStart(r);
                 if (rv != 0) {
                     membershipLeadershipTransferClose(r);
                 }
             }
         }
-        /* If this follower is in pipeline mode, send it more entries. */
-        if (progressState(r, i) == PROGRESS__PIPELINE) {
+        /* If this follower is in pipeline mode, send it more entries if
+         * needed. */
+        if (progressState(r, i) == PROGRESS__PIPELINE &&
+            progressShouldReplicate(r, i)) {
             replicationProgress(r, i);
         }
     }
 
 out:
     return 0;
-}
-
-static void sendAppendEntriesResultCb(struct raft_io_send *req, int status)
-{
-    (void)status;
-    HeapFree(req);
-}
-
-static void sendAppendEntriesResult(
-    struct raft *r,
-    const struct raft_append_entries_result *result)
-{
-    struct raft_message message;
-    struct raft_io_send *req;
-    int rv;
-
-    message.type = RAFT_IO_APPEND_ENTRIES_RESULT;
-    message.server_id = r->follower_state.current_leader.id;
-    message.server_address = r->follower_state.current_leader.address;
-    message.append_entries_result = *result;
-
-    req = raft_malloc(sizeof *req);
-    if (req == NULL) {
-        return;
-    }
-    req->data = r;
-
-    rv = r->io->send(r->io, req, &message, sendAppendEntriesResultCb);
-    if (rv != 0) {
-        raft_free(req);
-    }
 }
 
 /* Context for a write log entries request that was submitted by a follower. */
@@ -986,7 +1086,10 @@ static int deleteConflictingEntries(struct raft *r,
                 return RAFT_SHUTDOWN;
             }
 
-            tracef("log mismatch -> truncate (%llu)", entry_index);
+            tracef(
+                "local log has index %llu at term %llu, remote at %llu -> "
+                "truncate",
+                entry_index, local_term, entry->term);
 
             /* Possibly discard uncommitted configuration changes. */
             if (r->configuration_uncommitted_index >= entry_index) {
@@ -998,10 +1101,6 @@ static int deleteConflictingEntries(struct raft *r,
 
             /* Delete all entries from this index on because they don't
              * match. */
-            rv = r->io->truncate(r->io, entry_index);
-            if (rv != 0) {
-                return rv;
-            }
             logTruncate(&r->log, entry_index);
 
             /* Drop information about previously stored entries that have just
@@ -1030,7 +1129,9 @@ int replicationAppend(struct raft *r,
                       raft_index *rejected,
                       bool *async)
 {
-    struct appendFollower *request;
+    struct raft_entry *entries;
+    unsigned n_entries;
+    raft_index index;
     int match;
     size_t n;
     size_t i;
@@ -1062,7 +1163,8 @@ int replicationAppend(struct raft *r,
 
     *rejected = 0;
 
-    n = args->n_entries - i; /* Number of new entries */
+    n = args->n_entries - i;              /* Number of new entries */
+    index = args->prev_log_index + 1 + i; /* Index of first new entry */
 
     /* If this is an empty AppendEntries, there's nothing to write. However we
      * still want to check if we can commit some entry.
@@ -1087,16 +1189,6 @@ int replicationAppend(struct raft *r,
 
     *async = true;
 
-    request = raft_malloc(sizeof *request);
-    if (request == NULL) {
-        rv = RAFT_NOMEM;
-        goto err;
-    }
-
-    request->raft = r;
-    request->args = *args;
-    request->index = args->prev_log_index + 1 + i;
-
     /* Update our in-memory log to reflect that we received these entries. We'll
      * notify the leader of a successful append once the write entries request
      * that we issue below actually completes.  */
@@ -1107,38 +1199,32 @@ int replicationAppend(struct raft *r,
                        entry->batch);
         if (rv != 0) {
             /* TODO: we should revert any changes we made to the log */
-            goto err_after_request_alloc;
+            goto err;
         }
     }
 
     /* Acquire the relevant entries from the log. */
-    rv = logAcquire(&r->log, request->index, &request->args.entries,
-                    &request->args.n_entries);
+    rv = logAcquire(&r->log, index, &entries, &n_entries);
     if (rv != 0) {
-        goto err_after_request_alloc;
+        goto err;
     }
 
-    assert(request->args.n_entries == n);
+    assert(n_entries == n);
 
-    request->req.data = request;
-    rv = r->io->append(r->io, &request->req, request->args.entries,
-                       request->args.n_entries, appendFollowerCb);
+    rv = ioPersistEntries(r, index, entries, n_entries);
     if (rv != 0) {
+        /*
         ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
+        */
         goto err_after_acquire_entries;
     }
 
-    raft_free(args->entries);
+    HeapFree(args->entries);
 
     return 0;
 
 err_after_acquire_entries:
-    logRelease(&r->log, request->index, request->args.entries,
-               request->args.n_entries);
-
-err_after_request_alloc:
-    raft_free(request);
-
+    logRelease(&r->log, index, entries, n_entries);
 err:
     assert(rv != 0);
     return rv;
@@ -1150,13 +1236,14 @@ struct recvInstallSnapshot
     struct raft_snapshot snapshot;
 };
 
-static void installSnapshotCb(struct raft_io_snapshot_put *req, int status)
+void replicationPersistSnapshotDone(struct raft *r,
+                                    struct raft_persist_snapshot *persist,
+                                    int status)
 {
-    struct recvInstallSnapshot *request = req->data;
-    struct raft *r = request->raft;
-    struct raft_snapshot *snapshot = &request->snapshot;
     struct raft_append_entries_result result;
+    /*
     int rv;
+    */
 
     r->snapshot.put.data = NULL;
 
@@ -1169,9 +1256,7 @@ static void installSnapshotCb(struct raft_io_snapshot_put *req, int status)
     }
 
     if (status != 0) {
-        result.rejected = snapshot->index;
-        tracef("save snapshot %llu: %s", snapshot->index,
-               raft_strerror(status));
+        result.rejected = persist->snapshot.index;
         goto discard;
     }
 
@@ -1181,6 +1266,7 @@ static void installSnapshotCb(struct raft_io_snapshot_put *req, int status)
      *   8. Reset state machine using snapshot contents (and load lastConfig
      *      as cluster configuration).
      */
+    /*
     rv = snapshotRestore(r, snapshot);
     if (rv != 0) {
         result.rejected = snapshot->index;
@@ -1188,8 +1274,11 @@ static void installSnapshotCb(struct raft_io_snapshot_put *req, int status)
                raft_strerror(status));
         goto discard;
     }
+    */
 
-    tracef("restored snapshot with last index %llu", snapshot->index);
+    snapshotRestore(r, &persist->snapshot);
+
+    tracef("restored snapshot with last index %llu", persist->snapshot.index);
 
     result.rejected = 0;
 
@@ -1198,16 +1287,14 @@ static void installSnapshotCb(struct raft_io_snapshot_put *req, int status)
 discard:
     /* In case of error we must also free the snapshot data buffer and free the
      * configuration. */
-    raft_free(snapshot->bufs[0].base);
-    raft_configuration_close(&snapshot->configuration);
+    HeapFree(persist->snapshot.data.base);
+    configurationClose(&persist->snapshot.configuration);
 
 respond:
     if (r->state != RAFT_UNAVAILABLE) {
         result.last_log_index = r->last_stored;
         sendAppendEntriesResult(r, &result);
     }
-
-    raft_free(request);
 }
 
 int replicationInstallSnapshot(struct raft *r,
@@ -1215,8 +1302,10 @@ int replicationInstallSnapshot(struct raft *r,
                                raft_index *rejected,
                                bool *async)
 {
+    /*
     struct recvInstallSnapshot *request;
-    struct raft_snapshot *snapshot;
+    */
+    struct raft_snapshot snapshot;
     raft_term local_term;
     int rv;
 
@@ -1228,10 +1317,12 @@ int replicationInstallSnapshot(struct raft *r,
     /* If we are taking a snapshot ourselves or installing a snapshot, ignore
      * the request, the leader will weventually retry. TODO: we should do
      * something smarter. */
+    /*
     if (r->snapshot.pending.term != 0 || r->snapshot.put.data != NULL) {
         *async = true;
         return 0;
     }
+    */
 
     /* If our last snapshot is more up-to-date, this is a no-op */
     if (r->log.snapshot.last_index >= args->last_index) {
@@ -1253,6 +1344,7 @@ int replicationInstallSnapshot(struct raft *r,
 
     r->last_stored = 0;
 
+    /*
     request = raft_malloc(sizeof *request);
     if (request == NULL) {
         rv = RAFT_NOMEM;
@@ -1276,21 +1368,31 @@ int replicationInstallSnapshot(struct raft *r,
 
     assert(r->snapshot.put.data == NULL);
     r->snapshot.put.data = request;
+
     rv = r->io->snapshot_put(r->io,
-                             0 /* zero trailing means replace everything */,
+                             0,
                              &r->snapshot.put, snapshot, installSnapshotCb);
+    */
+    snapshot.index = args->last_index;
+    snapshot.term = args->last_index;
+    snapshot.configuration = args->conf;
+    snapshot.configuration_index = args->conf_index;
+    snapshot.data = args->data;
+
+    rv = ioPersistSnapshot(r, &snapshot);
     if (rv != 0) {
-        goto err_after_bufs_alloc;
+        goto err;
     }
 
     return 0;
 
+    /*
 err_after_bufs_alloc:
     raft_free(snapshot->bufs);
     r->snapshot.put.data = NULL;
-err_after_request_alloc:
-    raft_free(request);
+    */
 err:
+    /* TODO: undo the log restore. */
     assert(rv != 0);
     return rv;
 }
@@ -1302,11 +1404,17 @@ static int applyCommand(struct raft *r,
 {
     struct raft_apply *req;
     void *result;
+    /*
     int rv;
+    */
+    (void)buf;
+    result = NULL;
+    /*
     rv = r->fsm->apply(r->fsm, buf, &result);
     if (rv != 0) {
         return rv;
     }
+    */
     req = (struct raft_apply *)getRequest(r, index, RAFT_COMMAND);
     if (req != NULL && req->cb != NULL) {
         req->cb(req, 0, result);
@@ -1327,7 +1435,9 @@ static void applyBarrier(struct raft *r, const raft_index index)
 /* Apply a RAFT_CHANGE entry that has been committed. */
 static void applyChange(struct raft *r, const raft_index index)
 {
+    /*
     struct raft_change *req;
+    */
 
     assert(index > 0);
 
@@ -1343,8 +1453,10 @@ static void applyChange(struct raft *r, const raft_index index)
 
     if (r->state == RAFT_LEADER) {
         const struct raft_server *server;
+        /*
         req = r->leader_state.change;
         r->leader_state.change = NULL;
+        */
 
         /* If we are leader but not part of this new configuration, step
          * down.
@@ -1359,9 +1471,11 @@ static void applyChange(struct raft *r, const raft_index index)
             convertToFollower(r);
         }
 
+        /*
         if (req != NULL && req->cb != NULL) {
             req->cb(req, 0);
         }
+        */
     }
 }
 
@@ -1374,9 +1488,11 @@ static bool shouldTakeSnapshot(struct raft *r)
 
     /* If a snapshot is already in progress, we don't want to start another
      *  one. */
+    /*
     if (r->snapshot.pending.term != 0) {
         return false;
     };
+    */
 
     /* If we didn't reach the threshold yet, do nothing. */
     if (r->last_applied - r->log.snapshot.last_index < r->snapshot.threshold) {
@@ -1389,9 +1505,13 @@ static bool shouldTakeSnapshot(struct raft *r)
 static void takeSnapshotCb(struct raft_io_snapshot_put *req, int status)
 {
     struct raft *r = req->data;
+    (void)status;
+    /*
     struct raft_snapshot *snapshot;
+    */
 
     r->snapshot.put.data = NULL;
+    /*
     snapshot = &r->snapshot.pending;
 
     if (status != 0) {
@@ -1405,46 +1525,57 @@ static void takeSnapshotCb(struct raft_io_snapshot_put *req, int status)
 out:
     snapshotClose(&r->snapshot.pending);
     r->snapshot.pending.term = 0;
+    */
 }
 
 static int takeSnapshot(struct raft *r)
 {
     struct raft_snapshot *snapshot;
+    /*
     unsigned i;
     int rv;
+    */
 
     tracef("take snapshot at %lld", r->last_applied);
 
     snapshot = &r->snapshot.pending;
+    /*
     snapshot->index = r->last_applied;
     snapshot->term = logTermOf(&r->log, r->last_applied);
+    */
 
+    /*
     rv = configurationCopy(&r->configuration, &snapshot->configuration);
     if (rv != 0) {
         goto abort;
     }
 
     snapshot->configuration_index = r->configuration_index;
+    */
 
+    /*
     rv = r->fsm->snapshot(r->fsm, &snapshot->bufs, &snapshot->n_bufs);
     if (rv != 0) {
-        /* Ignore transient errors. We'll retry next time. */
         if (rv == RAFT_BUSY) {
             rv = 0;
         }
         goto abort_after_config_copy;
     }
+    */
 
     assert(r->snapshot.put.data == NULL);
     r->snapshot.put.data = r;
+    /*
     rv = r->io->snapshot_put(r->io, r->snapshot.trailing, &r->snapshot.put,
                              snapshot, takeSnapshotCb);
     if (rv != 0) {
         goto abort_after_fsm_snapshot;
     }
+    */
 
     return 0;
 
+    /*
 abort_after_fsm_snapshot:
     for (i = 0; i < snapshot->n_bufs; i++) {
         raft_free(snapshot->bufs[i].base);
@@ -1455,6 +1586,7 @@ abort_after_config_copy:
 abort:
     r->snapshot.pending.term = 0;
     return rv;
+    */
 }
 
 int replicationApply(struct raft *r)
@@ -1500,14 +1632,25 @@ int replicationApply(struct raft *r)
         r->last_applied = index;
     }
 
+    /*
     if (shouldTakeSnapshot(r)) {
         rv = takeSnapshot(r);
     }
+    */
 
     return rv;
 }
 
-void replicationQuorum(struct raft *r, const raft_index index)
+/* Check if a quorum has been reached for the given log index, and update the
+ * commit index accordingly if so.
+ *
+ * From Figure 3.1:
+ *
+ *   [Rules for servers] Leaders:
+ *
+ *   If there exists an N such that N > commitIndex, a majority of
+ *   matchIndex[i] >= N, and log[N].term == currentTerm: set commitIndex = N */
+static void replicationCheckQuorum(struct raft *r, raft_index index)
 {
     size_t votes = 0;
     size_t i;
@@ -1515,6 +1658,8 @@ void replicationQuorum(struct raft *r, const raft_index index)
     assert(r->state == RAFT_LEADER);
 
     if (index <= r->commit_index) {
+        tracef("replicated index %llu lower or equal than commit index %llu",
+               index, r->commit_index);
         return;
     }
 
@@ -1538,7 +1683,10 @@ void replicationQuorum(struct raft *r, const raft_index index)
 
     if (votes > configurationVoterCount(&r->configuration) / 2) {
         r->commit_index = index;
-        tracef("new commit index %llu", r->commit_index);
+        tracef("replication quorum reached -> commit index %llu",
+               r->commit_index);
+    } else {
+        tracef("replication quorum not reached for index %llu", index);
     }
 
     return;
