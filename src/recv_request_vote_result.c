@@ -8,12 +8,7 @@
 #include "replication.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 int recvRequestVoteResult(struct raft *r,
                           raft_id id,
@@ -37,7 +32,9 @@ int recvRequestVoteResult(struct raft *r,
 
     /* Ignore responses if we are not candidate anymore */
     if (r->state != RAFT_CANDIDATE) {
-        tracef("local server is not candidate -> ignore");
+        assert(r->state == RAFT_LEADER || r->state == RAFT_FOLLOWER);
+        const char *state = r->state == RAFT_LEADER ? "leader" : "follower";
+        tracef("local server is %s -> ignore", state);
         return 0;
     }
 
@@ -58,7 +55,8 @@ int recvRequestVoteResult(struct raft *r,
         /* If the term in the result is older than ours, this is an old message
          * we should ignore, because the node who voted for us would have
          * obtained our term.  This happens if the network is pretty choppy. */
-        tracef("local term is higher -> ignore");
+        tracef("remote term is lower (%llu vs %llu) -> ignore", result->term,
+               r->current_term);
         return 0;
     }
 
@@ -119,8 +117,8 @@ int recvRequestVoteResult(struct raft *r,
         } else {
             tracef("votes quorum not reached");
         }
-    } else {
-        tracef("vote was not granted");
+    } else if (match == 0) {
+        tracef("vote not granted");
     }
 
     return 0;
