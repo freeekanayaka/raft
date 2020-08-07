@@ -3,11 +3,13 @@
 #include "assert.h"
 #include "configuration.h"
 #include "election.h"
+#include "heap.h"
 #include "log.h"
 #include "membership.h"
 #include "progress.h"
 #include "queue.h"
 #include "request.h"
+#include "tracing.h"
 
 /* Set to 1 to enable tracing. */
 #if 0
@@ -83,6 +85,7 @@ static void convertClearLeader(struct raft *r)
     }
 
     /* Fail all outstanding requests */
+    /*
     while (!QUEUE_IS_EMPTY(&r->leader_state.requests)) {
         struct request *req;
         queue *head;
@@ -99,6 +102,7 @@ static void convertClearLeader(struct raft *r)
                 break;
         };
     }
+    */
 
     /* Fail any promote request that is still outstanding because the server is
      * still catching up and no entry was submitted. */
@@ -150,7 +154,7 @@ int convertToCandidate(struct raft *r, bool disrupt_leader)
     convertSetState(r, RAFT_CANDIDATE);
 
     /* Allocate the votes array. */
-    r->candidate_state.votes = raft_malloc(n_voters * sizeof(bool));
+    r->candidate_state.votes = HeapMalloc(n_voters * sizeof(bool));
     if (r->candidate_state.votes == NULL) {
         return RAFT_NOMEM;
     }
@@ -187,7 +191,7 @@ int convertToLeader(struct raft *r)
     convertSetState(r, RAFT_LEADER);
 
     /* Reset timers */
-    r->election_timer_start = r->io->time(r->io);
+    r->election_timer_start = r->clock->now(r->clock);
 
     /* Reset apply requests queue */
     QUEUE_INIT(&r->leader_state.requests);
@@ -212,9 +216,11 @@ int convertToLeader(struct raft *r)
 void convertToUnavailable(struct raft *r)
 {
     /* Abort any pending leadership transfer request. */
+    /*
     if (r->transfer != NULL) {
         membershipLeadershipTransferClose(r);
     }
+    */
     convertClear(r);
     convertSetState(r, RAFT_UNAVAILABLE);
 }
