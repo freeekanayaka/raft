@@ -4,16 +4,12 @@
 #include "configuration.h"
 #include "convert.h"
 #include "election.h"
+#include "heap.h"
 #include "recv.h"
 #include "replication.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 int recvRequestVoteResult(struct raft *r,
                           raft_id id,
@@ -37,7 +33,9 @@ int recvRequestVoteResult(struct raft *r,
 
     /* Ignore responses if we are not candidate anymore */
     if (r->state != RAFT_CANDIDATE) {
-        tracef("local server is not candidate -> ignore");
+        assert(r->state == RAFT_LEADER || r->state == RAFT_FOLLOWER);
+        const char *state = r->state == RAFT_LEADER ? "leader" : "follower";
+        tracef("local server is %s -> ignore", state);
         return 0;
     }
 
@@ -58,14 +56,15 @@ int recvRequestVoteResult(struct raft *r,
         /* If the term in the result is older than ours, this is an old message
          * we should ignore, because the node who voted for us would have
          * obtained our term.  This happens if the network is pretty choppy. */
-        tracef("local term is higher -> ignore");
+        tracef("remote term is lower (%llu vs %llu) -> ignore", result->term,
+               r->current_term);
         return 0;
     }
 
     /* If we're in the pre-vote phase, check that the peer's is at most one term
-     * ahead (possibly stepping down). If we're the actual voting phase, we
-     * expect our term must to be the same as the response term (otherwise we
-     * would have either ignored the result bumped our term). */
+     * ahead (possibly stepping down). If we're in the actual voting phase, we
+     * expect our term to be the same as the response term (otherwise we would
+     * have either ignored the result or bumped our term). */
     if (r->candidate_state.in_pre_vote) {
         if (match > 0) {
             if (result->term > r->current_term + 1) {
@@ -74,6 +73,10 @@ int recvRequestVoteResult(struct raft *r,
                 if (rv != 0) {
                     return rv;
                 }
+            } else {
+                /* Consider our terms as effectively matching, so we properly
+                 * emit a trace message for the rejection, see below */
+                match = 0;
             }
         }
     } else {
@@ -113,14 +116,13 @@ int recvRequestVoteResult(struct raft *r,
                 if (rv != 0) {
                     return rv;
                 }
-                /* Send initial heartbeat. */
-                replicationHeartbeat(r);
+                replicationHeartbeat(r, true);
             }
         } else {
             tracef("votes quorum not reached");
         }
-    } else {
-        tracef("vote was not granted");
+    } else if (match == 0) {
+        tracef("vote not granted");
     }
 
     return 0;
