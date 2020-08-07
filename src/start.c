@@ -4,18 +4,14 @@
 #include "convert.h"
 #include "entry.h"
 #include "err.h"
+#include "heap.h"
 #include "log.h"
 #include "recv.h"
 #include "snapshot.h"
 #include "tick.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 /* Restore the most recent configuration. */
 static int restoreMostRecentConfiguration(struct raft *r,
@@ -24,13 +20,13 @@ static int restoreMostRecentConfiguration(struct raft *r,
 {
     struct raft_configuration configuration;
     int rv;
-    raft_configuration_init(&configuration);
+    configurationInit(&configuration);
     rv = configurationDecode(&entry->buf, &configuration);
     if (rv != 0) {
-        raft_configuration_close(&configuration);
+        configurationClose(&configuration);
         return rv;
     }
-    raft_configuration_close(&r->configuration);
+    configurationClose(&r->configuration);
     r->configuration = configuration;
     r->configuration_index = index;
     return 0;
@@ -93,7 +89,7 @@ static int restoreEntries(struct raft *r,
             goto err;
         }
     }
-    raft_free(entries);
+    HeapFree(entries);
     return 0;
 
 err:
@@ -125,15 +121,17 @@ static int maybeSelfElect(struct raft *r)
     return 0;
 }
 
-int raft_start(struct raft *r)
+int startRestore(struct raft *r,
+                 raft_term term,
+                 raft_id voted_for,
+                 struct raft_snapshot *snapshot,
+                 raft_index start_index,
+                 struct raft_entry *entries,
+                 unsigned n_entries)
 {
-    struct raft_snapshot *snapshot;
+    int rv;
     raft_index snapshot_index = 0;
     raft_term snapshot_term = 0;
-    raft_index start_index;
-    struct raft_entry *entries;
-    size_t n_entries;
-    int rv;
 
     assert(r != NULL);
     assert(r->state == RAFT_UNAVAILABLE);
@@ -143,28 +141,20 @@ int raft_start(struct raft *r)
     assert(logSnapshotIndex(&r->log) == 0);
     assert(r->last_stored == 0);
 
-    tracef("starting");
-    rv = r->io->load(r->io, &r->current_term, &r->voted_for, &snapshot,
-                     &start_index, &entries, &n_entries);
-    if (rv != 0) {
-        ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
-        return rv;
-    }
+    r->current_term = term;
+    r->voted_for = voted_for;
+
     assert(start_index >= 1);
 
     /* If we have a snapshot, let's restore it. */
     if (snapshot != NULL) {
-        tracef("restore snapshot with last index %llu and last term %llu",
-               snapshot->index, snapshot->term);
-        rv = snapshotRestore(r, snapshot);
-        if (rv != 0) {
-            snapshotDestroy(snapshot);
-            entryBatchesDestroy(entries, n_entries);
-            return rv;
-        }
+        assert(snapshot->index > 0);
+        assert(snapshot->term > 0);
+        assert(snapshot->configuration_index > 0);
+        snapshotRestore(r, snapshot);
         snapshot_index = snapshot->index;
         snapshot_term = snapshot->term;
-        raft_free(snapshot);
+        HeapFree(snapshot);
     } else if (n_entries > 0) {
         /* If we don't have a snapshot and the on-disk log is not empty, then
          * the first entry must be a configuration entry. */
@@ -179,7 +169,6 @@ int raft_start(struct raft *r)
 
     /* Append the entries to the log, possibly restoring the last
      * configuration. */
-    tracef("restore %lu entries starting at %llu", n_entries, start_index);
     rv = restoreEntries(r, snapshot_index, snapshot_term, start_index, entries,
                         n_entries);
     if (rv != 0) {
@@ -187,13 +176,12 @@ int raft_start(struct raft *r)
         return rv;
     }
 
-    /* Start the I/O backend. The tickCb function is expected to fire every
-     * r->heartbeat_timeout milliseconds and recvCb whenever an RPC is
-     * received. */
-    rv = r->io->start(r->io, r->heartbeat_timeout, tickCb, recvCb);
-    if (rv != 0) {
-        return rv;
-    }
+    return 0;
+}
+
+int startConvert(struct raft *r)
+{
+    int rv;
 
     /* By default we start as followers. */
     convertToFollower(r);
