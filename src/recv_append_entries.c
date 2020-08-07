@@ -3,17 +3,13 @@
 #include "assert.h"
 #include "convert.h"
 #include "heap.h"
+#include "io.h"
 #include "log.h"
 #include "recv.h"
 #include "replication.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 static void recvSendAppendEntriesResultCb(struct raft_io_send *req, int status)
 {
@@ -26,7 +22,6 @@ int recvAppendEntries(struct raft *r,
                       const char *address,
                       const struct raft_append_entries *args)
 {
-    struct raft_io_send *req;
     struct raft_message message;
     struct raft_append_entries_result *result = &message.append_entries_result;
     int match;
@@ -106,7 +101,9 @@ int recvAppendEntries(struct raft *r,
     }
 
     /* Reset the election timer. */
-    r->election_timer_start = r->io->time(r->io);
+    r->election_timer_start = r->clock->now(r->clock);
+    r->timeout =
+        r->election_timer_start + r->follower_state.randomized_election_timeout;
 
     /* If we are installing a snapshot, ignore these entries. TODO: we should do
      * something smarter, e.g. buffering the entries in the I/O backend, which
@@ -143,15 +140,8 @@ reply:
     message.server_id = id;
     message.server_address = address;
 
-    req = HeapMalloc(sizeof *req);
-    if (req == NULL) {
-        return RAFT_NOMEM;
-    }
-    req->data = r;
-
-    rv = r->io->send(r->io, req, &message, recvSendAppendEntriesResultCb);
+    rv = ioSendMessage(r, id, address, message);
     if (rv != 0) {
-        raft_free(req);
         return rv;
     }
 
