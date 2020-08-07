@@ -2,16 +2,15 @@
 
 #include "assert.h"
 #include "configuration.h"
+#include "err.h"
 #include "heap.h"
+#include "io.h"
 #include "log.h"
+#include "prng.h"
+#include "queue.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 /* Common fields between follower and candidate state.
  *
@@ -38,32 +37,26 @@ struct followerOrCandidateState *getFollowerOrCandidateState(struct raft *r)
 void electionResetTimer(struct raft *r)
 {
     struct followerOrCandidateState *state = getFollowerOrCandidateState(r);
-    unsigned timeout = (unsigned)r->io->random(r->io, (int)r->election_timeout,
-                                               2 * (int)r->election_timeout);
+    unsigned timeout = (unsigned)prngRange(&r->prng, (int)r->election_timeout,
+                                           2 * (int)r->election_timeout);
     assert(timeout >= r->election_timeout);
     assert(timeout <= r->election_timeout * 2);
     state->randomized_election_timeout = timeout;
-    r->election_timer_start = r->io->time(r->io);
+    r->election_timer_start = r->clock->now(r->clock);
+    r->timeout = r->election_timer_start + state->randomized_election_timeout;
 }
 
 bool electionTimerExpired(struct raft *r)
 {
     struct followerOrCandidateState *state = getFollowerOrCandidateState(r);
-    raft_time now = r->io->time(r->io);
+    raft_time now = r->clock->now(r->clock);
     return now - r->election_timer_start >= state->randomized_election_timeout;
-}
-
-static void sendRequestVoteCb(struct raft_io_send *send, int status)
-{
-    (void)status;
-    HeapFree(send);
 }
 
 /* Send a RequestVote RPC to the given server. */
 static int electionSend(struct raft *r, const struct raft_server *server)
 {
     struct raft_message message;
-    struct raft_io_send *send;
     raft_term term;
     int rv;
     assert(server->id != r->id);
@@ -77,25 +70,15 @@ static int electionSend(struct raft *r, const struct raft_server *server)
     }
 
     message.type = RAFT_IO_REQUEST_VOTE;
-    message.request_vote.term = term;
+    message.request_vote.term = r->current_term;
     message.request_vote.candidate_id = r->id;
     message.request_vote.last_log_index = logLastIndex(&r->log);
     message.request_vote.last_log_term = logLastTerm(&r->log);
     message.request_vote.disrupt_leader = r->candidate_state.disrupt_leader;
     message.request_vote.pre_vote = r->candidate_state.in_pre_vote;
-    message.server_id = server->id;
-    message.server_address = server->address;
 
-    send = HeapMalloc(sizeof *send);
-    if (send == NULL) {
-        return RAFT_NOMEM;
-    }
-
-    send->data = r;
-
-    rv = r->io->send(r->io, send, &message, sendRequestVoteCb);
+    rv = ioSendMessage(r, server->id, server->address, message);
     if (rv != 0) {
-        HeapFree(send);
         return rv;
     }
 
@@ -129,22 +112,18 @@ int electionStart(struct raft *r)
      * that vote is no longer valid. */
     if (r->candidate_state.in_pre_vote) {
         /* Reset vote */
+        /*
         rv = r->io->set_vote(r->io, 0);
         if (rv != 0) {
             goto err;
         }
+        */
         /* Update our cache too. */
         r->voted_for = 0;
     } else {
         /* Increment current term */
         term = r->current_term + 1;
-        rv = r->io->set_term(r->io, term);
-        if (rv != 0) {
-            goto err;
-        }
-
-        /* Vote for self */
-        rv = r->io->set_vote(r->io, r->id);
+        rv = ioPersistTermAndVote(r, term, r->id);
         if (rv != 0) {
             goto err;
         }
@@ -176,7 +155,7 @@ int electionStart(struct raft *r)
         if (rv != 0) {
             /* This is not a critical failure, let's just log it. */
             tracef("failed to send vote request to server %llu: %s", server->id,
-                   raft_strerror(rv));
+                   errCodeToString(rv));
         }
     }
 
@@ -206,7 +185,7 @@ int electionVote(struct raft *r,
     *granted = false;
 
     if (local_server == NULL || local_server->role != RAFT_VOTER) {
-        tracef("local server is not voting -> not granting vote");
+        tracef("local server is not voting -> don't grant vote");
         return 0;
     }
 
@@ -215,6 +194,8 @@ int electionVote(struct raft *r,
     if (r->voted_for != 0 && r->voted_for != args->candidate_id &&
         !is_transferee) {
         tracef("local server already voted -> not granting vote");
+        tracef("local server already voted for %llu -> don't grant vote",
+               r->voted_for);
         return 0;
     }
 
@@ -222,7 +203,7 @@ int electionVote(struct raft *r,
 
     /* Our log is definitely not more up-to-date if it's empty! */
     if (local_last_index == 0) {
-        tracef("local log is empty -> granting vote");
+        tracef("local log is empty -> grant vote");
         goto grant_vote;
     }
 
@@ -231,18 +212,20 @@ int electionVote(struct raft *r,
     if (args->last_log_term < local_last_term) {
         /* The requesting server has last entry's log term lower than ours. */
         tracef(
-            "local last entry %llu has term %llu higher than %llu -> not "
-            "granting",
-            local_last_index, local_last_term, args->last_log_term);
+            "remote log has lower term (%llu/%llu vs %llu/%llu) -> don't "
+            "grant vote",
+            args->last_log_index, args->last_log_term, local_last_index,
+            local_last_term);
         return 0;
     }
 
     if (args->last_log_term > local_last_term) {
         /* The requesting server has a more up-to-date log. */
         tracef(
-            "remote last entry %llu has term %llu higher than %llu -> "
-            "granting vote",
-            args->last_log_index, args->last_log_term, local_last_term);
+            "remote log has higher term (%llu/%llu vs %llu/%llu) -> "
+            "grant vote",
+            args->last_log_index, args->last_log_term, local_last_index,
+            local_last_term);
         goto grant_vote;
     }
 
@@ -250,26 +233,38 @@ int electionVote(struct raft *r,
      * of the log. */
     assert(args->last_log_term == local_last_term);
 
-    if (local_last_index <= args->last_log_index) {
+    if (args->last_log_index >= local_last_index) {
         /* Our log is shorter or equal to the one of the requester. */
-        tracef("remote log equal or longer than local -> granting vote");
+        tracef(
+            "remote log equal or longer (%llu/%llu vs %llu/%llu) -> grant vote",
+            args->last_log_index, args->last_log_term, local_last_index,
+            local_last_term);
         goto grant_vote;
     }
 
-    tracef("remote log shorter than local -> not granting vote");
+    tracef(
+        "remote log shorter (%llu/%llu vs %llu/%llu) -> don't grant "
+        "vote",
+        args->last_log_index, args->last_log_term, local_last_index,
+        local_last_term);
 
     return 0;
 
 grant_vote:
+    assert(r->state == RAFT_FOLLOWER);
+
     if (!args->pre_vote) {
-        rv = r->io->set_vote(r->io, args->candidate_id);
+        rv = ioPersistTermAndVote(r, r->current_term, args->candidate_id);
         if (rv != 0) {
             return rv;
         }
+        /* Update our cache too. */
         r->voted_for = args->candidate_id;
 
         /* Reset the election timer. */
-        r->election_timer_start = r->io->time(r->io);
+        r->election_timer_start = r->clock->now(r->clock);
+        r->timeout = r->election_timer_start +
+                     r->follower_state.randomized_election_timeout;
     }
 
     *granted = true;
