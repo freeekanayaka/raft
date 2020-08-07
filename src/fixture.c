@@ -8,6 +8,7 @@
 #include "assert.h"
 #include "configuration.h"
 #include "entry.h"
+#include "heap.h"
 #include "log.h"
 #include "queue.h"
 #include "snapshot.h"
@@ -388,7 +389,7 @@ static void ioDestroyTransmit(struct transmit *transmit)
 }
 
 /* Flush all requests in the queue. */
-static void ioFlushAll(struct io *io)
+void ioFlushAll(struct io *io)
 {
     while (!QUEUE_IS_EMPTY(&io->requests)) {
         queue *head;
@@ -460,7 +461,7 @@ static int ioMethodLoad(struct raft_io *io,
         assert(*snapshot != NULL);
         rv = snapshotCopy(s->snapshot, *snapshot);
         assert(rv == 0);
-        *start_index = (*snapshot)->index + 1;
+        /* *start_index = (*snapshot)->index + 1; */
     } else {
         *snapshot = NULL;
     }
@@ -758,7 +759,7 @@ static void ioDeliverTransmit(struct io *io, struct transmit *transmit)
 /* Connect @raft_io to @other, enabling delivery of messages sent from @io to
  * @other.
  */
-static void ioConnect(struct raft_io *raft_io, struct raft_io *other)
+void ioConnect(struct raft_io *raft_io, struct raft_io *other)
 {
     struct io *io = raft_io->impl;
     struct io *io_other = other->impl;
@@ -818,15 +819,15 @@ static void ioSaturate(struct raft_io *io, struct raft_io *other)
 
 /* Desaturate the connection from @raft_io to @other, re-enabling delivery of
  * messages sent from @raft_io to @other. */
-static void ioDesaturate(struct raft_io *raft_io, struct raft_io *other)
-{
-    struct io *io = raft_io->impl;
-    struct io *io_other = other->impl;
-    struct peer *peer;
-    peer = ioGetPeer(io, io_other->id);
-    assert(peer != NULL && peer->connected);
-    peer->saturated = false;
-}
+/* static void ioDesaturate(struct raft_io *raft_io, struct raft_io *other) */
+/* { */
+/*     struct io *io = raft_io->impl; */
+/*     struct io *io_other = other->impl; */
+/*     struct peer *peer; */
+/*     peer = ioGetPeer(io, io_other->id); */
+/*     assert(peer != NULL && peer->connected); */
+/*     peer->saturated = false; */
+/* } */
 
 /* Enable or disable silently dropping all outgoing messages of type @type. */
 void ioDrop(struct io *io, int type, bool flag)
@@ -834,7 +835,7 @@ void ioDrop(struct io *io, int type, bool flag)
     io->drop[type - 1] = flag;
 }
 
-static int ioInit(struct raft_io *raft_io, unsigned index, raft_time *time)
+int ioInit(struct raft_io *raft_io, unsigned index, raft_time *time)
 {
     struct io *io;
     io = raft_malloc(sizeof *io);
@@ -899,79 +900,115 @@ void ioClose(struct raft_io *raft_io)
 }
 
 /* Custom emit tracer function which include the server ID. */
-static void emit(struct raft_tracer *t,
-                 const char *file,
-                 int line,
-                 const char *message)
+static void fixtureServerEmit(struct raft_tracer *t,
+                              const char *file,
+                              int line,
+                              const char *message)
 {
-    unsigned id = *(unsigned *)t->impl;
-    fprintf(stderr, "%d: %30s:%*d - %s\n", id, file, 3, line, message);
+    struct raft_fixture_server *s;
+    struct raft_fixture *f;
+    char trace[1024];
+    (void)file;
+    (void)line;
+    s = t->data;
+    f = s->fixture;
+    assert(trace != NULL);
+    if (message[0] == '>') {
+        snprintf(trace, sizeof trace, "[%4lld] %llu %s\n", f->time, s->raft.id,
+                 message);
+    } else {
+        snprintf(trace, sizeof trace, "         %s\n", message);
+    }
+    strcat(f->trace, trace);
 }
 
-static int serverInit(struct raft_fixture *f, unsigned i, struct raft_fsm *fsm)
+static int fixtureServerInit(struct raft_fixture_server *s,
+                             struct raft_fixture *fixture,
+                             raft_id id,
+                             raft_time now,
+                             raft_term term,
+                             raft_id voted_for,
+                             struct raft_snapshot_metadata *snapshot_metadata,
+                             raft_index start_index,
+                             struct raft_entry *entries,
+                             unsigned n_entries)
 {
     int rv;
-    struct raft_fixture_server *s = &f->servers[i];
-    s->alive = true;
-    s->id = i + 1;
-    sprintf(s->address, "%llu", s->id);
-    rv = ioInit(&s->io, i, &f->time);
+
+    s->fixture = fixture;
+    /* s->alive = true; */
+    /* s->id = i + 1; */
+    /* sprintf(s->address, "%llu", s->id); */
+    /* rv = ioInit(&s->io, i, &f->time); */
+    /* if (rv != 0) { */
+    /*     return rv; */
+    /* } */
+    rv = raft_init(&s->raft, id);
     if (rv != 0) {
-        return rv;
+        goto err;
     }
-    rv = raft_init(&s->raft, &s->io, fsm, s->id, s->address);
-    if (rv != 0) {
-        return rv;
-    }
-    raft_set_election_timeout(&s->raft, ELECTION_TIMEOUT);
-    raft_set_heartbeat_timeout(&s->raft, HEARTBEAT_TIMEOUT);
-    s->tracer.impl = (void *)&s->id;
-    s->tracer.emit = emit;
+
+    /* raft_set_election_timeout(&s->raft, ELECTION_TIMEOUT); */
+    /* raft_set_heartbeat_timeout(&s->raft, HEARTBEAT_TIMEOUT); */
+    s->tracer.data = s;
+    s->tracer.emit = fixtureServerEmit;
     s->raft.tracer = &s->tracer;
+
+    rv = raft_start(&s->raft, now, term, voted_for, snapshot_metadata,
+                    start_index, entries, n_entries);
+    if (rv != 0) {
+        goto err_after_raft_init;
+    }
+
     return 0;
+
+err_after_raft_init:
+    raft_close(&s->raft);
+err:
+    assert(rv != 0);
+    return rv;
 }
 
-static void serverClose(struct raft_fixture_server *s)
+static void fixtureServerClose(struct raft_fixture_server *s)
 {
-    raft_close(&s->raft, NULL);
-    ioClose(&s->io);
+    raft_close(&s->raft);
 }
 
 /* Connect the server with the given index to all others */
-static void serverConnectToAll(struct raft_fixture *f, unsigned i)
-{
-    unsigned j;
-    for (j = 0; j < f->n; j++) {
-        struct raft_io *io1 = &f->servers[i].io;
-        struct raft_io *io2 = &f->servers[j].io;
-        if (i == j) {
-            continue;
-        }
-        ioConnect(io1, io2);
-    }
-}
+/* static void serverConnectToAll(struct raft_fixture *f, unsigned i) */
+/* { */
+/*     unsigned j; */
+/*     for (j = 0; j < f->n; j++) { */
+/*         struct raft_io *io1 = &f->servers[i].io; */
+/*         struct raft_io *io2 = &f->servers[j].io; */
+/*         if (i == j) { */
+/*             continue; */
+/*         } */
+/*         ioConnect(io1, io2); */
+/*     } */
+/* } */
 
-int raft_fixture_init(struct raft_fixture *f, unsigned n, struct raft_fsm *fsms)
+int raft_fixture_init(struct raft_fixture *f)
 {
-    unsigned i;
-    int rc;
-    assert(n >= 1);
+    /* unsigned i; */
+    /* int rc; */
 
     f->time = 0;
-    f->n = n;
+    f->servers = NULL;
+    f->n = 0;
 
     /* Initialize all servers */
-    for (i = 0; i < n; i++) {
-        rc = serverInit(f, i, &fsms[i]);
-        if (rc != 0) {
-            return rc;
-        }
-    }
+    /* for (i = 0; i < n; i++) { */
+    /*     rc = serverInit(f, i, &fsms[i]); */
+    /*     if (rc != 0) { */
+    /*         return rc; */
+    /*     } */
+    /* } */
 
     /* Connect all servers to each another */
-    for (i = 0; i < f->n; i++) {
-        serverConnectToAll(f, i);
-    }
+    /* for (i = 0; i < f->n; i++) { */
+    /*     serverConnectToAll(f, i); */
+    /* } */
 
     logInit(&f->log);
     f->commit_index = 0;
@@ -984,65 +1021,119 @@ void raft_fixture_close(struct raft_fixture *f)
 {
     unsigned i;
     for (i = 0; i < f->n; i++) {
-        struct io *io = f->servers[i].io.impl;
-        ioFlushAll(io);
+        struct raft_fixture_server *server = f->servers[i];
+        fixtureServerClose(server);
+        HeapFree(server);
     }
-    for (i = 0; i < f->n; i++) {
-        serverClose(&f->servers[i]);
+    if (f->servers != NULL) {
+        HeapFree(f->servers);
     }
     logClose(&f->log);
 }
 
-int raft_fixture_configuration(struct raft_fixture *f,
-                               unsigned n_voting,
-                               struct raft_configuration *configuration)
+int raft_fixture_add(struct raft_fixture *f,
+                     raft_id id,
+                     raft_term term,
+                     raft_id voted_for,
+                     struct raft_snapshot_metadata *snapshot_metadata,
+                     raft_index start_index,
+                     struct raft_entry *entries,
+                     unsigned n_entries)
 {
+    struct raft_fixture_server **servers;
     unsigned i;
-    assert(f->n > 0);
-    assert(n_voting > 0);
-    assert(n_voting <= f->n);
-    raft_configuration_init(configuration);
-    for (i = 0; i < f->n; i++) {
-        struct raft_fixture_server *s;
-        int role = i < n_voting ? RAFT_VOTER : RAFT_STANDBY;
-        int rv;
-        s = &f->servers[i];
-        rv = raft_configuration_add(configuration, s->id, s->address, role);
-        if (rv != 0) {
-            return rv;
-        }
+    int rv;
+
+    servers = HeapRealloc(f->servers, (f->n + 1) * sizeof *f->servers);
+    if (servers == NULL) {
+        rv = RAFT_NOMEM;
+        goto err;
     }
+    f->servers = servers;
+
+    i = f->n;
+
+    servers[i] = HeapMalloc(sizeof **servers);
+    if (servers[i] == NULL) {
+        rv = RAFT_NOMEM;
+        goto err;
+    }
+
+    rv = fixtureServerInit(servers[i], f, id, f->time, term, voted_for,
+                           snapshot_metadata, start_index, entries, n_entries);
+    if (rv != 0) {
+        goto err_after_server_alloc;
+    }
+
+    f->n++;
+
     return 0;
+
+err_after_server_alloc:
+    HeapFree(servers[i]);
+err:
+    assert(rv != 0);
+    return rv;
 }
+
+const char *raft_fixture_trace(struct raft_fixture *f)
+{
+    return f->trace;
+}
+
+/* int raft_fixture_configuration(struct raft_fixture *f, */
+/*                                unsigned n_voting, */
+/*                                struct raft_configuration *configuration) */
+/* { */
+/*     unsigned i; */
+/*     assert(f->n > 0); */
+/*     assert(n_voting > 0); */
+/*     assert(n_voting <= f->n); */
+/*     raft_configuration_init(configuration); */
+/*     for (i = 0; i < f->n; i++) { */
+/*         struct raft_fixture_server *s; */
+/*         int role = i < n_voting ? RAFT_VOTER : RAFT_STANDBY; */
+/*         int rv; */
+/*         s = &f->servers[i]; */
+/*         rv = raft_configuration_add(configuration, s->id, s->address, role);
+ */
+/*         if (rv != 0) { */
+/*             return rv; */
+/*         } */
+/*     } */
+/*     return 0; */
+/* } */
 
 int raft_fixture_bootstrap(struct raft_fixture *f,
                            struct raft_configuration *configuration)
 {
-    unsigned i;
-    for (i = 0; i < f->n; i++) {
-        struct raft *raft = raft_fixture_get(f, i);
-        int rv;
-        rv = raft_bootstrap(raft, configuration);
-        if (rv != 0) {
-            return rv;
-        }
-    }
+    (void)f;
+    (void)configuration;
+    /* unsigned i; */
+    /* for (i = 0; i < f->n; i++) { */
+    /*     struct raft *raft = raft_fixture_get(f, i); */
+    /*     int rv; */
+    /*     rv = raft_bootstrap(raft, configuration); */
+    /*     if (rv != 0) { */
+    /*         return rv; */
+    /*     } */
+    /* } */
     return 0;
 }
 
-int raft_fixture_start(struct raft_fixture *f)
-{
-    unsigned i;
-    int rv;
-    for (i = 0; i < f->n; i++) {
-        struct raft_fixture_server *s = &f->servers[i];
-        rv = raft_start(&s->raft);
-        if (rv != 0) {
-            return rv;
-        }
-    }
-    return 0;
-}
+/* int raft_fixture_start(struct raft_fixture *f) */
+/* { */
+/*     unsigned i; */
+/*     int rv; */
+/*     for (i = 0; i < f->n; i++) { */
+/*         struct raft_fixture_server *s = &f->servers[i]; */
+/*         rv = raft_start(&s->raft); */
+/*         if (rv != 0) { */
+/*             return rv; */
+/*         } */
+/*     } */
+/*     return 0; */
+/* } */
 
 unsigned raft_fixture_n(struct raft_fixture *f)
 {
@@ -1054,16 +1145,23 @@ raft_time raft_fixture_time(struct raft_fixture *f)
     return f->time;
 }
 
-struct raft *raft_fixture_get(struct raft_fixture *f, unsigned i)
+struct raft *raft_fixture_get(struct raft_fixture *f, raft_id id)
 {
-    assert(i < f->n);
-    return &f->servers[i].raft;
+    unsigned i;
+    assert(id > 0);
+    for (i = 0; i < f->n; i++) {
+        struct raft_fixture_server *s = f->servers[i];
+        if (s->raft.id == id) {
+            return &s->raft;
+        }
+    }
+    return NULL;
 }
 
 bool raft_fixture_alive(struct raft_fixture *f, unsigned i)
 {
     assert(i < f->n);
-    return f->servers[i].alive;
+    return f->servers[i]->alive;
 }
 
 unsigned raft_fixture_leader_index(struct raft_fixture *f)
@@ -1074,11 +1172,11 @@ unsigned raft_fixture_leader_index(struct raft_fixture *f)
     return f->n;
 }
 
-raft_id raft_fixture_voted_for(struct raft_fixture *f, unsigned i)
-{
-    struct io *io = f->servers[i].io.impl;
-    return io->voted_for;
-}
+/* raft_id raft_fixture_voted_for(struct raft_fixture *f, unsigned i) */
+/* { */
+/*     struct io *io = f->servers[i].io.impl; */
+/*     return io->voted_for; */
+/* } */
 
 /* Update the leader and check for election safety.
  *
@@ -1284,15 +1382,18 @@ static void updateCommitIndex(struct raft_fixture *f)
  * server index */
 static void getLowestTickTime(struct raft_fixture *f, raft_time *t, unsigned *i)
 {
-    unsigned j;
-    *t = (raft_time)-1 /* Maximum value */;
-    for (j = 0; j < f->n; j++) {
-        struct io *io = f->servers[j].io.impl;
-        if (io->next_tick < *t) {
-            *t = io->next_tick;
-            *i = j;
-        }
-    }
+    (void)f;
+    (void)t;
+    (void)i;
+    /* unsigned j; */
+    /* *t = (raft_time)-1 /\* Maximum value *\/; */
+    /* for (j = 0; j < f->n; j++) { */
+    /*     struct io *io = f->servers[j].io.impl; */
+    /*     if (io->next_tick < *t) { */
+    /*         *t = io->next_tick; */
+    /*         *i = j; */
+    /*     } */
+    /* } */
 }
 
 /* Return the completion time of the request with the lowest completion time
@@ -1304,7 +1405,7 @@ static void getLowestRequestCompletionTime(struct raft_fixture *f,
     unsigned j;
     *t = (raft_time)-1 /* Maximum value */;
     for (j = 0; j < f->n; j++) {
-        struct io *io = f->servers[j].io.impl;
+        struct io *io = f->servers[j]->io.impl;
         queue *head;
         QUEUE_FOREACH(head, &io->requests)
         {
@@ -1320,7 +1421,7 @@ static void getLowestRequestCompletionTime(struct raft_fixture *f,
 /* Fire the tick callback of the i'th server. */
 static void fireTick(struct raft_fixture *f, unsigned i)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     f->time = io->next_tick;
     f->event.server_index = i;
     f->event.type = RAFT_FIXTURE_TICK;
@@ -1331,7 +1432,7 @@ static void fireTick(struct raft_fixture *f, unsigned i)
 /* Complete the first request with completion time @t on the @i'th server. */
 static void completeRequest(struct raft_fixture *f, unsigned i, raft_time t)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     queue *head;
     struct ioRequest *r = NULL;
     bool found = false;
@@ -1375,7 +1476,7 @@ static void completeRequest(struct raft_fixture *f, unsigned i, raft_time t)
 
 struct raft_fixture_event *raft_fixture_step(struct raft_fixture *f)
 {
-    raft_time tick_time;
+    raft_time tick_time = 0;
     raft_time completion_time;
     unsigned i = f->n;
     unsigned j = f->n;
@@ -1481,7 +1582,7 @@ static void dropAllExcept(struct raft_fixture *f,
 {
     unsigned j;
     for (j = 0; j < f->n; j++) {
-        struct raft_fixture_server *s = &f->servers[j];
+        struct raft_fixture_server *s = f->servers[j];
         if (j == i) {
             continue;
         }
@@ -1494,16 +1595,16 @@ static void dropAllExcept(struct raft_fixture *f,
 static void minimizeRandomizedElectionTimeout(struct raft_fixture *f,
                                               unsigned i)
 {
-    struct raft *raft = &f->servers[i].raft;
-    raft_time now = raft->io->time(raft->io);
+    struct raft *raft = &f->servers[i]->raft;
+    /* raft_time now = raft->io->time(raft->io); */
     unsigned timeout = raft->election_timeout;
     assert(raft->state == RAFT_FOLLOWER);
 
     /* If the minimum election timeout value would make the timer expire in the
      * past, cap it. */
-    if (now - raft->election_timer_start > timeout) {
-        timeout = (unsigned)(now - raft->election_timer_start);
-    }
+    /* if (now - raft->election_timer_start > timeout) { */
+    /*     timeout = (unsigned)(now - raft->election_timer_start); */
+    /* } */
 
     raft->follower_state.randomized_election_timeout = timeout;
 }
@@ -1515,7 +1616,7 @@ static void maximizeAllRandomizedElectionTimeoutsExcept(struct raft_fixture *f,
 {
     unsigned j;
     for (j = 0; j < f->n; j++) {
-        struct raft *raft = &f->servers[j].raft;
+        struct raft *raft = &f->servers[j]->raft;
         unsigned timeout = raft->election_timeout * 2;
         if (j == i) {
             continue;
@@ -1544,7 +1645,7 @@ void raft_fixture_elect(struct raft_fixture *f, unsigned i)
 
     /* Make sure all servers are currently followers. */
     for (j = 0; j < f->n; j++) {
-        assert(raft_state(&f->servers[j].raft) == RAFT_FOLLOWER);
+        assert(raft_state(&f->servers[j]->raft) == RAFT_FOLLOWER);
     }
 
     /* Pretend that the last randomized election timeout was set at the maximum
@@ -1564,7 +1665,7 @@ void raft_fixture_depose(struct raft_fixture *f)
     /* Make sure there's a leader. */
     assert(f->leader_id != 0);
     leader_i = (unsigned)f->leader_id - 1;
-    assert(raft_state(&f->servers[leader_i].raft) == RAFT_LEADER);
+    assert(raft_state(&f->servers[leader_i]->raft) == RAFT_LEADER);
 
     /* Set a very large election timeout on all followers, to prevent them from
      * starting an election. */
@@ -1588,22 +1689,23 @@ struct step_apply
 
 static bool hasAppliedIndex(struct raft_fixture *f, void *arg)
 {
-    struct step_apply *apply = (struct step_apply *)arg;
-    struct raft *raft;
+    /* struct step_apply *apply = (struct step_apply *)arg; */
+    /* struct raft *raft; */
     unsigned n = 0;
-    unsigned i;
+    /* unsigned i; */
+    (void)arg;
 
-    if (apply->i < f->n) {
-        raft = raft_fixture_get(f, apply->i);
-        return raft_last_applied(raft) >= apply->index;
-    }
+    /* if (apply->i < f->n) { */
+    /*     raft = raft_fixture_get(f, apply->i); */
+    /*     return raft_last_applied(raft) >= apply->index; */
+    /* } */
 
-    for (i = 0; i < f->n; i++) {
-        raft = raft_fixture_get(f, i);
-        if (raft_last_applied(raft) >= apply->index) {
-            n++;
-        }
-    }
+    /* for (i = 0; i < f->n; i++) { */
+    /*     raft = raft_fixture_get(f, i); */
+    /*     if (raft_last_applied(raft) >= apply->index) { */
+    /*         n++; */
+    /*     } */
+    /* } */
     return n == f->n;
 }
 
@@ -1694,12 +1796,13 @@ struct step_deliver
 static bool hasDelivered(struct raft_fixture *f, void *arg)
 {
     struct step_deliver *target = (struct step_deliver *)arg;
-    struct raft *raft;
+    /* struct raft *raft; */
     struct io *io;
     struct raft_message *message;
     queue *head;
-    raft = raft_fixture_get(f, target->i);
-    io = raft->io->impl;
+    (void)f;
+    /* raft = raft_fixture_get(f, target->i); */
+    io = NULL;
     QUEUE_FOREACH(head, &io->requests)
     {
         struct ioRequest *r;
@@ -1731,85 +1834,86 @@ bool raft_fixture_step_until_delivered(struct raft_fixture *f,
 
 void raft_fixture_disconnect(struct raft_fixture *f, unsigned i, unsigned j)
 {
-    struct raft_io *io1 = &f->servers[i].io;
-    struct raft_io *io2 = &f->servers[j].io;
+    struct raft_io *io1 = &f->servers[i]->io;
+    struct raft_io *io2 = &f->servers[j]->io;
     ioDisconnect(io1, io2);
 }
 
 void raft_fixture_reconnect(struct raft_fixture *f, unsigned i, unsigned j)
 {
-    struct raft_io *io1 = &f->servers[i].io;
-    struct raft_io *io2 = &f->servers[j].io;
+    struct raft_io *io1 = &f->servers[i]->io;
+    struct raft_io *io2 = &f->servers[j]->io;
     ioReconnect(io1, io2);
 }
 
 void raft_fixture_saturate(struct raft_fixture *f, unsigned i, unsigned j)
 {
-    struct raft_io *io1 = &f->servers[i].io;
-    struct raft_io *io2 = &f->servers[j].io;
+    struct raft_io *io1 = &f->servers[i]->io;
+    struct raft_io *io2 = &f->servers[j]->io;
     ioSaturate(io1, io2);
 }
 
-static void disconnectFromAll(struct raft_fixture *f, unsigned i)
-{
-    unsigned j;
-    for (j = 0; j < f->n; j++) {
-        if (j == i) {
-            continue;
-        }
-        raft_fixture_saturate(f, i, j);
-        raft_fixture_saturate(f, j, i);
-    }
-}
+/* static void disconnectFromAll(struct raft_fixture *f, unsigned i) */
+/* { */
+/*     unsigned j; */
+/*     for (j = 0; j < f->n; j++) { */
+/*         if (j == i) { */
+/*             continue; */
+/*         } */
+/*         raft_fixture_saturate(f, i, j); */
+/*         raft_fixture_saturate(f, j, i); */
+/*     } */
+/* } */
 
 bool raft_fixture_saturated(struct raft_fixture *f, unsigned i, unsigned j)
 {
-    struct raft_io *io1 = &f->servers[i].io;
-    struct raft_io *io2 = &f->servers[j].io;
+    struct raft_io *io1 = &f->servers[i]->io;
+    struct raft_io *io2 = &f->servers[j]->io;
     return ioSaturated(io1, io2);
 }
 
-void raft_fixture_desaturate(struct raft_fixture *f, unsigned i, unsigned j)
-{
-    struct raft_io *io1 = &f->servers[i].io;
-    struct raft_io *io2 = &f->servers[j].io;
-    ioDesaturate(io1, io2);
-}
+/* void raft_fixture_desaturate(struct raft_fixture *f, unsigned i, unsigned j)
+ */
+/* { */
+/*     struct raft_io *io1 = &f->servers[i].io; */
+/*     struct raft_io *io2 = &f->servers[j].io; */
+/*     ioDesaturate(io1, io2); */
+/* } */
 
-void raft_fixture_kill(struct raft_fixture *f, unsigned i)
-{
-    disconnectFromAll(f, i);
-    f->servers[i].alive = false;
-}
+/* void raft_fixture_kill(struct raft_fixture *f, unsigned i) */
+/* { */
+/*     disconnectFromAll(f, i); */
+/*     f->servers[i].alive = false; */
+/* } */
 
-int raft_fixture_grow(struct raft_fixture *f, struct raft_fsm *fsm)
-{
-    unsigned i;
-    unsigned j;
-    int rc;
-    i = f->n;
-    f->n++;
+/* int raft_fixture_grow(struct raft_fixture *f, struct raft_fsm *fsm) */
+/* { */
+/*     unsigned i; */
+/*     unsigned j; */
+/*     int rc; */
+/*     i = f->n; */
+/*     f->n++; */
 
-    rc = serverInit(f, i, fsm);
-    if (rc != 0) {
-        return rc;
-    }
+/*     rc = serverInit(f, i, fsm); */
+/*     if (rc != 0) { */
+/*         return rc; */
+/*     } */
 
-    serverConnectToAll(f, i);
-    for (j = 0; j < f->n; j++) {
-        struct raft_io *io1 = &f->servers[i].io;
-        struct raft_io *io2 = &f->servers[j].io;
-        ioConnect(io2, io1);
-    }
+/*     serverConnectToAll(f, i); */
+/*     for (j = 0; j < f->n; j++) { */
+/*         struct raft_io *io1 = &f->servers[i].io; */
+/*         struct raft_io *io2 = &f->servers[j].io; */
+/*         ioConnect(io2, io1); */
+/*     } */
 
-    return 0;
-}
+/*     return 0; */
+/* } */
 
 void raft_fixture_set_randomized_election_timeout(struct raft_fixture *f,
                                                   unsigned i,
                                                   unsigned msecs)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->randomized_election_timeout = msecs;
 }
 
@@ -1817,7 +1921,7 @@ void raft_fixture_set_network_latency(struct raft_fixture *f,
                                       unsigned i,
                                       unsigned msecs)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->network_latency = msecs;
 }
 
@@ -1825,13 +1929,13 @@ void raft_fixture_set_disk_latency(struct raft_fixture *f,
                                    unsigned i,
                                    unsigned msecs)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->disk_latency = msecs;
 }
 
 void raft_fixture_set_term(struct raft_fixture *f, unsigned i, raft_term term)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->term = term;
 }
 
@@ -1839,7 +1943,7 @@ void raft_fixture_set_snapshot(struct raft_fixture *f,
                                unsigned i,
                                struct raft_snapshot *snapshot)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->snapshot = snapshot;
 }
 
@@ -1847,7 +1951,7 @@ void raft_fixture_add_entry(struct raft_fixture *f,
                             unsigned i,
                             struct raft_entry *entry)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     struct raft_entry *entries;
     entries = raft_realloc(io->entries, (io->n + 1) * sizeof *entries);
     assert(entries != NULL);
@@ -1861,20 +1965,20 @@ void raft_fixture_io_fault(struct raft_fixture *f,
                            int delay,
                            int repeat)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     io->fault.countdown = delay;
     io->fault.n = repeat;
 }
 
 unsigned raft_fixture_n_send(struct raft_fixture *f, unsigned i, int type)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     return io->n_send[type];
 }
 
 unsigned raft_fixture_n_recv(struct raft_fixture *f, unsigned i, int type)
 {
-    struct io *io = f->servers[i].io.impl;
+    struct io *io = f->servers[i]->io.impl;
     return io->n_recv[type];
 }
 
