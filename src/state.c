@@ -4,11 +4,6 @@
 #include "log.h"
 #include "queue.h"
 
-int raft_state(struct raft *r)
-{
-    return r->state;
-}
-
 void raft_leader(struct raft *r, raft_id *id, const char **address)
 {
     switch (r->state) {
@@ -22,7 +17,7 @@ void raft_leader(struct raft *r, raft_id *id, const char **address)
             *address = r->follower_state.current_leader.address;
             return;
         case RAFT_LEADER:
-            if (r->transfer != NULL) {
+            if (r->transfer.id != 0) {
                 *id = 0;
                 *address = NULL;
                 return;
