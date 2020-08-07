@@ -2,28 +2,19 @@
 
 #include "assert.h"
 #include "election.h"
+#include "heap.h"
+#include "queue.h"
 #include "recv.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
-
-static void requestVoteSendCb(struct raft_io_send *req, int status)
-{
-    (void)status;
-    raft_free(req);
-}
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 int recvRequestVote(struct raft *r,
                     const raft_id id,
                     const char *address,
                     const struct raft_request_vote *args)
 {
-    struct raft_io_send *req;
+    struct raft_send_message *send;
     struct raft_message message;
     struct raft_request_vote_result *result = &message.request_vote_result;
     bool has_leader;
@@ -59,7 +50,7 @@ int recvRequestVote(struct raft *r,
         r->state == RAFT_LEADER ||
         (r->state == RAFT_FOLLOWER && r->follower_state.current_leader.id != 0);
     if (has_leader && !args->disrupt_leader) {
-        tracef("local server has a leader -> reject ");
+        tracef("local server has a leader -> reject");
         goto reply;
     }
 
@@ -81,7 +72,8 @@ int recvRequestVote(struct raft *r,
      *
      */
     if (match < 0) {
-        tracef("local term is higher -> reject ");
+        tracef("remote term is lower (%llu vs %llu) -> reject", args->term,
+               r->current_term);
         goto reply;
     }
 
@@ -101,20 +93,18 @@ reply:
     result->term = r->current_term;
 
     message.type = RAFT_IO_REQUEST_VOTE_RESULT;
-    message.server_id = id;
-    message.server_address = address;
 
-    req = raft_malloc(sizeof *req);
-    if (req == NULL) {
+    send = HeapMalloc(sizeof *send);
+    if (send == NULL) {
         return RAFT_NOMEM;
     }
-    req->data = r;
 
-    rv = r->io->send(r->io, req, &message, requestVoteSendCb);
-    if (rv != 0) {
-        raft_free(req);
-        return rv;
-    }
+    send->type = RAFT_SEND_MESSAGE;
+    send->id = id;
+    send->address = address;
+    send->message = message;
+
+    QUEUE_PUSH(&r->io, &send->queue);
 
     return 0;
 }
