@@ -4,11 +4,6 @@
 #include "log.h"
 #include "queue.h"
 
-int raft_state(struct raft *r)
-{
-    return r->state;
-}
-
 void raft_leader(struct raft *r, raft_id *id, const char **address)
 {
     switch (r->state) {
