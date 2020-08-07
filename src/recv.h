@@ -5,9 +5,16 @@
 
 #include "../include/raft.h"
 
+int recvMessage(struct raft *r,
+                raft_id id,
+                const char *address,
+                struct raft_message *message);
+
 /* Callback to be passed to the raft_io implementation. It will be invoked upon
  * receiving an RPC message. */
 void recvCb(struct raft_io *io, struct raft_message *message);
+
+int recvBumpCurrentTerm(struct raft *r, raft_term term);
 
 /* Compare a request's term with the server's current term.
  *
@@ -15,10 +22,6 @@ void recvCb(struct raft_io *io, struct raft_message *message);
  * request's term, to -1 if the request's term is lower, and to 1 if the
  * request's term is higher. */
 void recvCheckMatchingTerms(struct raft *r, raft_term term, int *match);
-
-/* Bump the current term and possibly step down from candidate or leader
- * state. */
-int recvBumpCurrentTerm(struct raft *r, raft_term term);
 
 /* Common logic for RPC handlers, comparing the request's term with the server's
  * current term and possibly deciding to reject the request or step down from
