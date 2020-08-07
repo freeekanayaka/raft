@@ -22,14 +22,16 @@ enum {
 /**
  * State of a single server in a cluster fixture.
  */
+struct raft_fixture;
 struct raft_fixture_server
 {
-    bool alive;                /* If false, the server is down. */
-    raft_id id;                /* Server ID. */
-    char address[16];          /* Server address (stringified ID). */
-    struct raft_tracer tracer; /* Tracer. */
-    struct raft_io io;         /* In-memory raft_io implementation. */
-    struct raft raft;          /* Raft instance. */
+    bool alive;                   /* If false, the server is down. */
+    raft_id id;                   /* Server ID. */
+    char address[16];             /* Server address (stringified ID). */
+    struct raft_io io;            /* In-memory raft_io implementation. */
+    struct raft_fixture *fixture; /* Fixture the server belongs to. */
+    struct raft_tracer tracer;    /* Custom tracer. */
+    struct raft raft;             /* Raft instance. */
 };
 
 /**
@@ -49,44 +51,50 @@ typedef void (*raft_fixture_event_cb)(struct raft_fixture *f,
                                       struct raft_fixture_event *event);
 
 /**
- * Test implementation of a cluster of @n servers, each having a user-provided
- * FSM.
+ * Helper to set up and drive a cluster of @raft servers.
  *
- * The cluster can simulate network latency and time elapsed on individual
+ * The fixture can simulate network latency and time elapsed on individual
  * servers.
- *
- * Servers can be alive or dead. Network messages sent to dead servers are
- * dropped. Dead servers do not have their @raft_io_tick_cb callback invoked.
- *
- * Any two servers can be connected or disconnected. Network messages sent
- * between disconnected servers are dropped.
  */
 struct raft_fixture
 {
-    raft_time time;                  /* Global time, common to all servers. */
-    unsigned n;                      /* Number of servers. */
-    raft_id leader_id;               /* ID of current leader, or 0 if none. */
-    struct raft_log log;             /* Copy of current leader's log. */
-    raft_index commit_index;         /* Current commit index on leader. */
-    struct raft_fixture_event event; /* Last event occurred. */
-    raft_fixture_event_cb hook;      /* Event callback. */
-    struct raft_fixture_server servers[RAFT_FIXTURE_MAX_SERVERS];
+    raft_time time;                       /* Global time, for all servers */
+    struct raft_fixture_server **servers; /* Servers in the cluster */
+    unsigned n;                           /* Number of servers. */
+    raft_id leader_id;                    /* ID of current leader, or 0 */
+    struct raft_log log;                  /* Copy of current leader's log */
+    raft_index commit_index;              /* Current commit index on leader */
+    struct raft_fixture_event event;      /* Last event occurred */
+    raft_fixture_event_cb hook;           /* Event callback */
+    char trace[8192];                     /* Captured trace messages */
 };
 
 /**
- * Initialize a raft cluster fixture with @n servers. Each server will use an
- * in-memory @raft_io implementation and one of the given @fsms. All servers
- * will be initially connected to one another, but they won't be bootstrapped or
- * started.
+ * Initialize the fixture. The cluster is initially empty.
  */
-RAFT_API int raft_fixture_init(struct raft_fixture *f,
-                               unsigned n,
-                               struct raft_fsm *fsms);
+RAFT_API int raft_fixture_init(struct raft_fixture *f);
 
 /**
  * Release all memory used by the fixture.
  */
 RAFT_API void raft_fixture_close(struct raft_fixture *f);
+
+/**
+ * Add a new @raft server to the fixture's cluster.
+ *
+ * The server will be automatically initialized with the given @id and started
+ * using the given initial state.
+ */
+RAFT_API int raft_fixture_add(struct raft_fixture *f,
+                              raft_id id,
+                              raft_term term,
+                              raft_id voted_for,
+                              struct raft_snapshot_metadata *snapshot_metadata,
+                              raft_index start_index,
+                              struct raft_entry *entries,
+                              unsigned n_entries);
+
+RAFT_API const char *raft_fixture_trace(struct raft_fixture *f);
 
 /**
  * Convenience to generate a configuration object containing all servers in the
@@ -119,9 +127,10 @@ RAFT_API unsigned raft_fixture_n(struct raft_fixture *f);
 RAFT_API raft_time raft_fixture_time(struct raft_fixture *f);
 
 /**
- * Return the raft instance associated with the @i'th server of the fixture.
+ * Return the @raft server associated with given id or #NULL if the fixture has
+ * no server with the given ID.
  */
-RAFT_API struct raft *raft_fixture_get(struct raft_fixture *f, unsigned i);
+RAFT_API struct raft *raft_fixture_get(struct raft_fixture *f, raft_id id);
 
 /**
  * Return @true if the @i'th server hasn't been killed.
