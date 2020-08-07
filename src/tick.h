@@ -5,8 +5,13 @@
 
 #include "../include/raft.h"
 
-/* Callback to be passed to the @raft_io implementation. It notifies us that a
- * certain amount of time has elapsed and will be invoked periodically. */
-void tickCb(struct raft_io *io);
+/* Apply time-dependent rules for followers (Figure 3.1). */
+int tickFollower(struct raft *r);
+
+/* Apply time-dependent rules for candidates (Figure 3.1). */
+int tickCandidate(struct raft *r);
+
+/* Apply time-dependent rules for leaders (Figure 3.1). */
+int tickLeader(struct raft *r);
 
 #endif /* TICK_H_ */

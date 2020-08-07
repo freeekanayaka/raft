@@ -8,15 +8,9 @@
 #include "replication.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
-/* Apply time-dependent rules for followers (Figure 3.1). */
-static int tickFollower(struct raft *r)
+int tickFollower(struct raft *r)
 {
     const struct raft_server *server;
     int rv;
@@ -45,8 +39,9 @@ static int tickFollower(struct raft *r)
      *   If election timeout elapses without receiving AppendEntries RPC from
      *   current leader or granting vote to candidate, convert to candidate.
      */
-    if (electionTimerExpired(r) && server->role == RAFT_VOTER) {
-        tracef("convert to candidate and start new election");
+    if (server->role == RAFT_VOTER && electionTimerExpired(r)) {
+        tracef("convert to candidate and start new election for term %llu",
+               r->current_term + 1);
         rv = convertToCandidate(r, false /* disrupt leader */);
         if (rv != 0) {
             tracef("convert to candidate: %s", raft_strerror(rv));
@@ -57,8 +52,7 @@ static int tickFollower(struct raft *r)
     return 0;
 }
 
-/* Apply time-dependent rules for candidates (Figure 3.1). */
-static int tickCandidate(struct raft *r)
+int tickCandidate(struct raft *r)
 {
     assert(r != NULL);
     assert(r->state == RAFT_CANDIDATE);
@@ -74,7 +68,8 @@ static int tickCandidate(struct raft *r)
      *   incrementing its term and initiating another round of RequestVote RPCs
      */
     if (electionTimerExpired(r)) {
-        tracef("start new election");
+        tracef("stay candidate and start new election for term %llu",
+               r->current_term + 1);
         return electionStart(r);
     }
 
@@ -106,11 +101,12 @@ static bool checkContactQuorum(struct raft *r)
     return contacts > configurationVoterCount(&r->configuration) / 2;
 }
 
-/* Apply time-dependent rules for leaders (Figure 3.1). */
-static int tickLeader(struct raft *r)
+int tickLeader(struct raft *r)
 {
-    raft_time now = r->io->time(r->io);
+    raft_time now;
+
     assert(r->state == RAFT_LEADER);
+    now = r->clock->now(r->clock);
 
     /* Check if we still can reach a majority of servers.
      *
@@ -126,7 +122,7 @@ static int tickLeader(struct raft *r)
             convertToFollower(r);
             return 0;
         }
-        r->election_timer_start = r->io->time(r->io);
+        r->election_timer_start = now;
     }
 
     /* Possibly send heartbeats.
@@ -151,25 +147,32 @@ static int tickLeader(struct raft *r)
      *   error.
      */
     if (r->leader_state.promotee_id != 0) {
+        /*
         raft_id id = r->leader_state.promotee_id;
         unsigned server_index;
         raft_time round_duration = now - r->leader_state.round_start;
         bool is_too_slow;
         bool is_unresponsive;
+        */
 
         /* If a promotion is in progress, we expect that our configuration
          * contains an entry for the server being promoted, and that the server
          * is not yet considered as voting. */
+        /*
         server_index = configurationIndexOf(&r->configuration, id);
         assert(server_index < r->configuration.n);
         assert(r->configuration.servers[server_index].role != RAFT_VOTER);
+        */
 
+        /*
         is_too_slow = (r->leader_state.round_number == r->max_catch_up_rounds &&
                        round_duration > r->election_timeout);
         is_unresponsive = round_duration > r->max_catch_up_round_duration;
+        */
 
         /* Abort the promotion if we are at the 10'th round and it's still
          * taking too long, or if the server is unresponsive. */
+        /*
         if (is_too_slow || is_unresponsive) {
             struct raft_change *change;
 
@@ -185,57 +188,10 @@ static int tickLeader(struct raft *r)
                 change->cb(change, RAFT_NOCONNECTION);
             }
         }
+        */
     }
 
     return 0;
-}
-
-static int tick(struct raft *r)
-{
-    int rv = -1;
-
-    assert(r->state == RAFT_UNAVAILABLE || r->state == RAFT_FOLLOWER ||
-           r->state == RAFT_CANDIDATE || r->state == RAFT_LEADER);
-
-    /* If we are not available, let's do nothing. */
-    if (r->state == RAFT_UNAVAILABLE) {
-        return 0;
-    }
-
-    switch (r->state) {
-        case RAFT_FOLLOWER:
-            rv = tickFollower(r);
-            break;
-        case RAFT_CANDIDATE:
-            rv = tickCandidate(r);
-            break;
-        case RAFT_LEADER:
-            rv = tickLeader(r);
-            break;
-    }
-
-    return rv;
-}
-
-void tickCb(struct raft_io *io)
-{
-    struct raft *r;
-    int rv;
-    r = io->data;
-    rv = tick(r);
-    if (rv != 0) {
-        convertToUnavailable(r);
-        return;
-    }
-
-    /* For all states: if there is a leadership transfer request in progress,
-     * check if it's expired. */
-    if (r->transfer != NULL) {
-        raft_time now = r->io->time(r->io);
-        if (now - r->transfer->start >= r->election_timeout) {
-            membershipLeadershipTransferClose(r);
-        }
-    }
 }
 
 #undef tracef
