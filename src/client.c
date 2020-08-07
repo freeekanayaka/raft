@@ -11,23 +11,15 @@
 #include "tracing.h"
 
 /* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
-int raft_apply(struct raft *r,
-               struct raft_apply *req,
-               const struct raft_buffer bufs[],
-               const unsigned n,
-               raft_apply_cb cb)
+int clientAccept(struct raft *r, struct raft_buffer *commands, unsigned n)
 {
     raft_index index;
     int rv;
 
     assert(r != NULL);
-    assert(bufs != NULL);
+    assert(commands != NULL);
     assert(n > 0);
 
     if (r->state != RAFT_LEADER || r->transfer != NULL) {
@@ -38,18 +30,21 @@ int raft_apply(struct raft *r,
 
     /* Index of the first entry being appended. */
     index = logLastIndex(&r->log) + 1;
-    tracef("%u commands starting at %lld", n, index);
+    /*
     req->type = RAFT_COMMAND;
     req->index = index;
     req->cb = cb;
+    */
 
     /* Append the new entries to the log. */
-    rv = logAppendCommands(&r->log, r->current_term, bufs, n);
+    rv = logAppendCommands(&r->log, r->current_term, commands, n);
     if (rv != 0) {
         goto err;
     }
 
+    /*
     QUEUE_PUSH(&r->leader_state.requests, &req->queue);
+    */
 
     rv = replicationTrigger(r, index);
     if (rv != 0) {
@@ -60,7 +55,9 @@ int raft_apply(struct raft *r,
 
 err_after_log_append:
     logDiscard(&r->log, index);
+    /*
     QUEUE_REMOVE(&req->queue);
+    */
 err:
     assert(rv != 0);
     return rv;
@@ -182,7 +179,7 @@ int raft_add(struct raft *r,
         return rv;
     }
 
-    tracef("add server: id %d, address %s", id, address);
+    tracef("add server: id %llu, address %s", id, address);
 
     /* Make a copy of the current configuration, and add the new server to
      * it. */
@@ -299,13 +296,15 @@ int raft_assign(struct raft *r,
     /* Initialize the first catch-up round. */
     r->leader_state.round_number = 1;
     r->leader_state.round_index = last_index;
+    /*
     r->leader_state.round_start = r->io->time(r->io);
+    */
 
     /* Immediately initiate an AppendEntries request. */
     rv = replicationProgress(r, server_index);
     if (rv != 0 && rv != RAFT_NOCONNECTION) {
         /* This error is not fatal. */
-        tracef("failed to send append entries to server %u: %s (%d)",
+        tracef("failed to send append entries to server %llu: %s (%d)",
                server->id, raft_strerror(rv), rv);
     }
 
@@ -336,7 +335,7 @@ int raft_remove(struct raft *r,
         goto err;
     }
 
-    tracef("remove server: id %d", id);
+    tracef("remove server: id %llu", id);
 
     /* Make a copy of the current configuration, and remove the given server
      * from it. */
