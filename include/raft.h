@@ -76,8 +76,8 @@ struct raft_buffer
  */
 
 #define RAFT_STANDBY 0 /* Replicate log, does not participate in quorum. */
-#define RAFT_VOTER 1   /* Replicate log, does participate in quorum. */
-#define RAFT_SPARE 2   /* Does not replicate log, or participate in quorum. */
+#define RAFT_VOTER 1 /* Replicate log, does participate in quorum. */
+#define RAFT_SPARE 2 /* Does not replicate log, or participate in quorum. */
 
 /**
  * Hold information about a single server in the cluster configuration.
@@ -182,9 +182,9 @@ enum {
  */
 struct raft_entry
 {
-    raft_term term;         /* Term in which the entry was created. */
-    unsigned short type;    /* Type (FSM command, barrier, config change). */
+    unsigned short type;    /* Type (FSM command, no-op or config change). */
     struct raft_buffer buf; /* Entry data. */
+    raft_term term;         /* Term in which the entry was created. */
     void *batch;            /* Batch that buf's memory points to, if any. */
 };
 
@@ -325,10 +325,8 @@ enum {
  */
 struct raft_message
 {
-    unsigned short type;        /* RPC type code. */
-    raft_id server_id;          /* ID of sending or destination server. */
-    const char *server_address; /* Address of sending or destination server. */
-    union {                     /* Type-specific data */
+    unsigned short type; /* RPC type code. */
+    union {              /* Type-specific data */
         struct raft_request_vote request_vote;
         struct raft_request_vote_result request_vote_result;
         struct raft_append_entries append_entries;
@@ -352,11 +350,8 @@ struct raft_snapshot
     struct raft_configuration configuration;
     raft_index configuration_index;
 
-    /* Content of the snapshot. When a snapshot is taken, the user FSM can fill
-     * the bufs array with more than one buffer. When a snapshot is restored,
-     * there will always be a single buffer. */
-    struct raft_buffer *bufs;
-    unsigned n_bufs;
+    /* Content of the FSM snapshot. */
+    struct raft_buffer data;
 };
 
 /**
@@ -406,6 +401,25 @@ struct raft_io_snapshot_get
     raft_io_snapshot_get_cb cb; /* Request callback */
 };
 
+struct raft_clock
+{
+    void *data;
+
+    /* Return the current time.
+     *
+     * The implementation must return monotonically increasing values and never
+     * return a value which is lower than the previously returned value. */
+    raft_time (*now)(struct raft_clock *c);
+
+    /* Schedule a call to raft_tick() at the given number of milliseconds.
+     *
+     * Any previously scheduled called should be canceled.
+     *
+     * The implementation maybe invoke raft_tick() at a slightly later time, but
+     * never earlier. */
+    void (*timeout)(struct raft_clock *c, unsigned msecs);
+};
+
 /**
  * Customizable tracer, for debugging purposes.
  */
@@ -414,7 +428,7 @@ struct raft_tracer
     /**
      * Implementation-defined state object.
      */
-    void *impl;
+    void *data;
 
     /**
      * Emit the given trace message, possibly decorating it with the provided
@@ -424,78 +438,6 @@ struct raft_tracer
                  const char *file,
                  int line,
                  const char *message);
-};
-
-struct raft_io; /* Forward declaration. */
-
-/**
- * Callback invoked by the I/O implementation at regular intervals.
- */
-typedef void (*raft_io_tick_cb)(struct raft_io *io);
-
-/**
- * Callback invoked by the I/O implementation when an RPC message is received.
- */
-typedef void (*raft_io_recv_cb)(struct raft_io *io, struct raft_message *msg);
-
-typedef void (*raft_io_close_cb)(struct raft_io *io);
-
-struct raft_io
-{
-    int version;
-    void *data;
-    void *impl;
-    char errmsg[RAFT_ERRMSG_BUF_SIZE];
-    int (*init)(struct raft_io *io, raft_id id, const char *address);
-    void (*close)(struct raft_io *io, raft_io_close_cb cb);
-    int (*load)(struct raft_io *io,
-                raft_term *term,
-                raft_id *voted_for,
-                struct raft_snapshot **snapshot,
-                raft_index *start_index,
-                struct raft_entry *entries[],
-                size_t *n_entries);
-    int (*start)(struct raft_io *io,
-                 unsigned msecs,
-                 raft_io_tick_cb tick,
-                 raft_io_recv_cb recv);
-    int (*bootstrap)(struct raft_io *io, const struct raft_configuration *conf);
-    int (*recover)(struct raft_io *io, const struct raft_configuration *conf);
-    int (*set_term)(struct raft_io *io, raft_term term);
-    int (*set_vote)(struct raft_io *io, raft_id server_id);
-    int (*send)(struct raft_io *io,
-                struct raft_io_send *req,
-                const struct raft_message *message,
-                raft_io_send_cb cb);
-    int (*append)(struct raft_io *io,
-                  struct raft_io_append *req,
-                  const struct raft_entry entries[],
-                  unsigned n,
-                  raft_io_append_cb cb);
-    int (*truncate)(struct raft_io *io, raft_index index);
-    int (*snapshot_put)(struct raft_io *io,
-                        unsigned trailing,
-                        struct raft_io_snapshot_put *req,
-                        const struct raft_snapshot *snapshot,
-                        raft_io_snapshot_put_cb cb);
-    int (*snapshot_get)(struct raft_io *io,
-                        struct raft_io_snapshot_get *req,
-                        raft_io_snapshot_get_cb cb);
-    raft_time (*time)(struct raft_io *io);
-    int (*random)(struct raft_io *io, int min, int max);
-};
-
-struct raft_fsm
-{
-    int version;
-    void *data;
-    int (*apply)(struct raft_fsm *fsm,
-                 const struct raft_buffer *buf,
-                 void **result);
-    int (*snapshot)(struct raft_fsm *fsm,
-                    struct raft_buffer *bufs[],
-                    unsigned *n_bufs);
-    int (*restore)(struct raft_fsm *fsm, struct raft_buffer *buf);
 };
 
 /**
@@ -534,12 +476,10 @@ struct raft_transfer; /* Forward declaration */
  */
 struct raft
 {
-    void *data;                 /* Custom user data. */
-    struct raft_tracer *tracer; /* Tracer implementation. */
-    struct raft_io *io;         /* Disk and network I/O implementation. */
-    struct raft_fsm *fsm;       /* User-defined FSM to apply commands to. */
     raft_id id;                 /* Server ID of this raft instance. */
     char *address;              /* Server address of this raft instance. */
+    struct raft_clock *clock;   /* Time source */
+    struct raft_tracer *tracer; /* Optional tracer implementation. */
 
     /*
      * Cache of the server's persistent state, updated on stable storage before
@@ -594,7 +534,7 @@ struct raft
      *
      * This is the baseline value and will be randomized between 1x and 2x.
      *
-     * See raft_change_election_timeout() to customize the value of this
+     * See raft_set_election_timeout() to customize the value of this
      * attribute.
      */
     unsigned election_timeout;
@@ -635,6 +575,7 @@ struct raft
             {
                 raft_id id;
                 char *address;
+                raft_index commit_index; /* Last commit index seen */
             } current_leader;
         } follower_state;
         struct
@@ -647,7 +588,6 @@ struct raft
         struct
         {
             struct raft_progress *progress; /* Per-server replication state. */
-            struct raft_change *change;     /* Pending membership change. */
             raft_id promotee_id;            /* ID of server being promoted. */
             unsigned short round_number;    /* Current sync round. */
             raft_index round_index;         /* Target of the current round. */
@@ -667,7 +607,12 @@ struct raft
     raft_time election_timer_start;
 
     /* In-progress leadership transfer request, if any. */
-    struct raft_transfer *transfer;
+    struct
+    {
+        raft_id id;
+        raft_time start;
+        bool timeout_sent;
+    } transfer;
 
     /*
      * Information about the last snapshot that was taken (if any).
@@ -678,12 +623,8 @@ struct raft
         unsigned trailing;               /* N. of trailing entries to retain */
         struct raft_snapshot pending;    /* In progress snapshot */
         struct raft_io_snapshot_put put; /* Store snapshot request */
+        struct raft_buffer data;
     } snapshot;
-
-    /*
-     * Callback to invoke once a close request has completed.
-     */
-    raft_close_cb close_cb;
 
     /*
      * Human-readable message providing diagnostic information about the last
@@ -699,23 +640,82 @@ struct raft
      * being promoted to voter. */
     unsigned max_catch_up_rounds;
     unsigned max_catch_up_round_duration;
+
+    /* Random number generator state. */
+    unsigned prng;
+
+    void *io[2]; /* Network and disk I/O queue */
 };
 
-RAFT_API int raft_init(struct raft *r,
-                       struct raft_io *io,
-                       struct raft_fsm *fsm,
-                       raft_id id,
-                       const char *address);
+enum raft_io_type {
+    RAFT_SEND_MESSAGE = 0,
+    RAFT_PERSIST_ENTRIES,
+    RAFT_PERSIST_TERM_AND_VOTE,
+    RAFT_PERSIST_SNAPSHOT
+};
 
-RAFT_API void raft_close(struct raft *r, raft_close_cb cb);
+#define RAFT_IO_FIELDS      \
+    enum raft_io_type type; \
+    void *queue[2]
+
+struct raft_io
+{
+    RAFT_IO_FIELDS;
+};
+
+struct raft_send_message
+{
+    RAFT_IO_FIELDS;
+    raft_id id;
+    const char *address; /* TODO: make a copy */
+    struct raft_message message;
+};
+
+struct raft_persist_entries
+{
+    RAFT_IO_FIELDS;
+    raft_index first_index;
+    struct raft_entry *entries;
+    unsigned n;
+};
+
+struct raft_persist_term_and_vote
+{
+    RAFT_IO_FIELDS;
+    raft_term term;
+    raft_id voted_for;
+};
+
+struct raft_persist_snapshot
+{
+    RAFT_IO_FIELDS;
+    struct raft_snapshot snapshot;
+};
+
+RAFT_API int raft_init(struct raft *r, raft_id id, const char *address);
+
+RAFT_API void raft_close(struct raft *r);
+
+RAFT_API void raft_seed(struct raft *r, unsigned n);
+
+RAFT_API int raft_tick(struct raft *r);
 
 /**
- * Bootstrap this raft instance using the given configuration. The instance must
- * not have been started yet and must be completely pristine, otherwise
- * #RAFT_CANTBOOTSTRAP will be returned.
+ * Return the next pending I/O operation that should be performed.
+ *
+ * Operations of type #RAFT_PERSIST_TERM_AND_VOTE must be carried out
+ * synchronously before any subsequent operation (such as sending messages) is
+ * even started. In case a #RAFT_PERSIST_TERM_AND_VOTE operation hits an error
+ * then the raft engine should be shutdown immediately.
  */
-RAFT_API int raft_bootstrap(struct raft *r,
-                            const struct raft_configuration *conf);
+RAFT_API struct raft_io *raft_pending(struct raft *r);
+
+RAFT_API int raft_done(struct raft *r, struct raft_io *io, int status);
+
+RAFT_API int raft_recv(struct raft *r,
+                       raft_id id,
+                       const char *address,
+                       struct raft_message *message);
 
 /**
  * Force a new configuration in order to recover from a loss of quorum where the
@@ -742,7 +742,40 @@ RAFT_API int raft_bootstrap(struct raft *r,
 RAFT_API int raft_recover(struct raft *r,
                           const struct raft_configuration *conf);
 
-RAFT_API int raft_start(struct raft *r);
+RAFT_API int raft_start(struct raft *r,
+                        struct raft_clock *clock,
+                        raft_term term,
+                        raft_id voted_for,
+                        struct raft_snapshot *snapshot,
+                        raft_index start_index,
+                        struct raft_entry *entries,
+                        unsigned n_entries);
+
+/**
+ * Propose to append commands to the log and apply them to the FSM once
+ * committed.
+ *
+ * If this server is the leader, it will create @n new log entries of type
+ * #RAFT_COMMAND using the given buffers as their payloads, append them to its
+ * own log and attempt to replicate them on other servers by sending
+ * AppendEntries RPCs.
+ *
+ * The memory pointed at by the @base attribute of each #raft_buffer in the
+ * given array must have been allocated with raft_malloc() or a compatible
+ * allocator. If this function returns 0, the ownership of this memory is
+ * implicitly transferred to the raft library, which will take care of releasing
+ * it when appropriate. Any further client access to such memory leads to
+ * undefined behavior.
+ *
+ * The ownership of the memory of the @bufs array itself is not transferred to
+ * the raft library, and, if allocated dynamically, must be deallocated by the
+ * caller.
+ */
+RAFT_API int raft_accept(struct raft *r,
+                         struct raft_entry *entries,
+                         unsigned n);
+
+RAFT_API int raft_snapshot(struct raft *r, raft_index index);
 
 /**
  * Set the election timeout.
@@ -951,19 +984,8 @@ struct raft_transfer
  * The special value #0 means to automatically select a voting follower to
  * transfer leadership to. If there are no voting followers, return
  * #RAFT_NOTFOUND.
- *
- * When this server detects that the target server has become the leader, or
- * when @election_timeout milliseconds have elapsed, the given callback will be
- * invoked.
- *
- * After the callback files, clients can check whether the operation was
- * successful or not by calling @raft_leader() and checking if it returns the
- * target server.
  */
-RAFT_API int raft_transfer(struct raft *r,
-                           struct raft_transfer *req,
-                           raft_id id,
-                           raft_transfer_cb cb);
+RAFT_API int raft_transfer(struct raft *r, raft_id id);
 
 /**
  * User-definable dynamic memory allocation functions.
