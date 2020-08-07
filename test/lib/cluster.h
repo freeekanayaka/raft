@@ -7,52 +7,44 @@
 
 #include "../../include/raft.h"
 #include "../../include/raft/fixture.h"
+#include "cluster.h"
 #include "fsm.h"
 #include "heap.h"
 #include "munit.h"
 #include "snapshot.h"
 
-#define FIXTURE_CLUSTER                             \
-    FIXTURE_HEAP;                                   \
-    struct raft_fsm fsms[RAFT_FIXTURE_MAX_SERVERS]; \
-    struct raft_fixture cluster
+#define CLUSTER_N_MAX 8
 
-/* N is the default number of servers, but can be tweaked with the cluster-n
- * parameter. */
-#define SETUP_CLUSTER(DEFAULT_N)                                             \
-    SET_UP_HEAP;                                                             \
-    do {                                                                     \
-        unsigned _n = DEFAULT_N;                                             \
-        bool _pre_vote = false;                                              \
-        unsigned _i;                                                         \
-        int _rv;                                                             \
-        if (munit_parameters_get(params, CLUSTER_N_PARAM) != NULL) {         \
-            _n = atoi(munit_parameters_get(params, CLUSTER_N_PARAM));        \
-        }                                                                    \
-        if (munit_parameters_get(params, CLUSTER_PRE_VOTE_PARAM) != NULL) {  \
-            _pre_vote =                                                      \
-                atoi(munit_parameters_get(params, CLUSTER_PRE_VOTE_PARAM));  \
-        }                                                                    \
-        munit_assert_int(_n, >, 0);                                          \
-        for (_i = 0; _i < _n; _i++) {                                        \
-            FsmInit(&f->fsms[_i]);                                           \
-        }                                                                    \
-        _rv = raft_fixture_init(&f->cluster, _n, f->fsms);                   \
-        munit_assert_int(_rv, ==, 0);                                        \
-        for (_i = 0; _i < _n; _i++) {                                        \
-            raft_set_pre_vote(raft_fixture_get(&f->cluster, _i), _pre_vote); \
-        }                                                                    \
-    } while (0)
+/* Macro helpers. */
+#define FIXTURE_CLUSTER \
+    FIXTURE_HEAP;       \
+    struct test_cluster cluster
 
-#define TEAR_DOWN_CLUSTER                 \
-    do {                                  \
-        unsigned i;                       \
-        raft_fixture_close(&f->cluster);  \
-        for (i = 0; i < CLUSTER_N; i++) { \
-            FsmClose(&f->fsms[i]);        \
-        }                                 \
-    } while (0);                          \
-    TEAR_DOWN_HEAP;
+#define SETUP_CLUSTER \
+    SET_UP_HEAP;       \
+    test_cluster_setup(params, &f->cluster)
+
+#define TEAR_DOWN_CLUSTER                \
+    test_cluster_tear_down(&f->cluster); \
+    TEAR_DOWN_HEAP
+
+#define CLUSTER_NOW test_cluster_now(&f->cluster)
+
+#define CLUSTER_GROW(N) test_cluster_grow(&f->cluster, N)
+
+#define CLUSTER_GET(ID) test_cluster_get(&f->cluster, ID)
+
+#define CLUSTER_BOOTSTRAP(ID, N, N_VOTING) \
+    test_cluster_bootstrap(&f->cluster, ID, N, N_VOTING)
+
+#define CLUSTER_START(ID) test_cluster_start(&f->cluster, ID)
+
+#define CLUSTER_STEP test_cluster_step(&f->cluster)
+
+#define CLUSTER_TRACE(EXPECTED)                       \
+    if (!test_cluster_trace(&f->cluster, EXPECTED)) { \
+        munit_error("trace does not match");          \
+    }
 
 /* Munit parameter for setting the number of servers */
 #define CLUSTER_N_PARAM "cluster-n"
@@ -66,9 +58,6 @@
 /* Get the number of servers in the cluster. */
 #define CLUSTER_N raft_fixture_n(&f->cluster)
 
-/* Get the cluster time. */
-#define CLUSTER_TIME raft_fixture_time(&f->cluster)
-
 /* Index of the current leader, or CLUSTER_N if there's no leader. */
 #define CLUSTER_LEADER raft_fixture_leader_index(&f->cluster)
 
@@ -78,11 +67,30 @@
 /* Get the struct raft object of the I'th server. */
 #define CLUSTER_RAFT(I) raft_fixture_get(&f->cluster, I)
 
-/* Get the state of the I'th server. */
-#define CLUSTER_STATE(I) raft_state(raft_fixture_get(&f->cluster, I))
+/* Assert the state of the server with the given ID. */
+#define CLUSTER_STATE(ID, STATE) \
+    munit_assert_int(raft_state(CLUSTER_GET(ID)), ==, STATE)
 
-/* Get the current term of the I'th server. */
-#define CLUSTER_TERM(I) raft_fixture_get(&f->cluster, I)->current_term
+/* Append an entry to the log persisted on disk. */
+#define CLUSTER_PERSIST_ENTRY(ID, ENTRY) \
+    test_cluster_persist_entry(&f->cluster, ID, ENTRY)
+
+/* Append a RAFT_COMMAND entry to the log persisted on disk. The payload will be
+ * a 64-bit intger with the given value. */
+#define CLUSTER_PERSIST_COMMAND(ID, TERM, N) \
+    do {                                     \
+        struct raft_entry entry_;            \
+        int64_t n_ = (int64_t)N;             \
+        entry_.type = RAFT_COMMAND;          \
+        entry_.term = TERM;                  \
+        entry_.buf.len = sizeof n_;          \
+        entry_.buf.base = &n_;               \
+        CLUSTER_PERSIST_ENTRY(ID, &entry_);  \
+    } while (0)
+
+/* Set the persisted term of the given server to the given value. */
+#define CLUSTER_PERSIST_TERM(ID, TERM) \
+    test_cluster_persist_term(&f->cluster, ID, TERM)
 
 /* Get the struct fsm object of the I'th server. */
 #define CLUSTER_FSM(I) &f->fsms[I]
@@ -108,20 +116,23 @@
 
 /* Bootstrap all servers in the cluster. All servers will be voting, unless the
  * cluster-n-voting parameter is used. */
-#define CLUSTER_BOOTSTRAP                                                    \
-    {                                                                        \
-        unsigned n_ = CLUSTER_N;                                             \
-        int rv_;                                                             \
-        struct raft_configuration configuration;                             \
-        if (munit_parameters_get(params, CLUSTER_N_VOTING_PARAM) != NULL) {  \
-            n_ = atoi(munit_parameters_get(params, CLUSTER_N_VOTING_PARAM)); \
-        }                                                                    \
-        rv_ = raft_fixture_configuration(&f->cluster, n_, &configuration);   \
-        munit_assert_int(rv_, ==, 0);                                        \
-        rv_ = raft_fixture_bootstrap(&f->cluster, &configuration);           \
-        munit_assert_int(rv_, ==, 0);                                        \
-        raft_configuration_close(&configuration);                            \
-    }
+/* #define CLUSTER_BOOTSTRAP \ */
+/*     { \ */
+/*         unsigned n_ = CLUSTER_N; \ */
+/*         int rv_; \ */
+/*         struct raft_configuration configuration; \ */
+/*         if (munit_parameters_get(params, CLUSTER_N_VOTING_PARAM) != NULL) {
+ * \ */
+/*             n_ = atoi(munit_parameters_get(params, CLUSTER_N_VOTING_PARAM));
+ * \ */
+/*         } \ */
+/*         rv_ = raft_fixture_configuration(&f->cluster, n_, &configuration);
+ * \ */
+/*         munit_assert_int(rv_, ==, 0); \ */
+/*         rv_ = raft_fixture_bootstrap(&f->cluster, &configuration); \ */
+/*         munit_assert_int(rv_, ==, 0); \ */
+/*         raft_configuration_close(&configuration); \ */
+/*     } */
 
 /* Bootstrap all servers in the cluster. Only the first N servers will be
  * voting. */
@@ -136,16 +147,46 @@
         raft_configuration_close(&configuration_);                         \
     }
 
+/* Start the cluster as a new with a configuration containing the first N
+ * servers as voters. */
+#define CLUSTER_START_AS_NEW(N_VOTERS)                                         \
+    do {                                                                       \
+        struct raft_configuration _conf;                                       \
+        unsigned _i;                                                           \
+        int _rv;                                                               \
+        raft_configuration_init(&_conf);                                       \
+        for (_i = 0; _i < N_VOTERS; _i++) {                                    \
+            raft_id _id = _i + 1;                                              \
+            char _address[64];                                                 \
+            int _role = _i < N_VOTERS ? RAFT_VOTER : RAFT_STANDBY;             \
+            sprintf(_address, "%llu", _id);                                    \
+            _rv = raft_configuration_add(&_conf, _id, _address, _role);        \
+            munit_assert_int(_rv, ==, 0);                                      \
+        }                                                                      \
+        for (_i = 0; _i < N_VOTERS; _i++) {                                    \
+            struct raft_entry *_entry = raft_malloc(sizeof *_entry);           \
+            munit_assert_ptr_not_null(_entry);                                 \
+            _entry->term = 1;                                                  \
+            _entry->type = RAFT_CHANGE;                                        \
+            _entry->batch = NULL;                                              \
+            raft_configuration_encode(&_conf, &_entry->buf);                   \
+            _rv = raft_fixture_add(&f->cluster, _i + 1, 1, 0, NULL, 1, _entry, \
+                                   1);                                         \
+            munit_assert_int(_rv, ==, 0);                                      \
+        }                                                                      \
+        raft_configuration_close(&_conf);                                      \
+    } while (0)
+
 /* Start all servers in the test cluster. */
-#define CLUSTER_START                         \
-    {                                         \
-        int rc;                               \
-        rc = raft_fixture_start(&f->cluster); \
-        munit_assert_int(rc, ==, 0);          \
-    }
+/* #define CLUSTER_START                         \ */
+/*     {                                         \ */
+/*         int rc;                               \ */
+/*         rc = raft_fixture_start(&f->cluster); \ */
+/*         munit_assert_int(rc, ==, 0);          \ */
+/*     } */
 
 /* Step the cluster. */
-#define CLUSTER_STEP raft_fixture_step(&f->cluster);
+/* #define CLUSTER_STEP raft_fixture_step(&f->cluster); */
 
 /* Step the cluster N times. */
 #define CLUSTER_STEP_N(N)                   \
@@ -268,29 +309,20 @@
         }                                                    \
     }
 
-/* Grow the cluster adding one server. */
-#define CLUSTER_GROW                                               \
-    {                                                              \
-        int rv_;                                                   \
-        FsmInit(&f->fsms[CLUSTER_N]);                              \
-        rv_ = raft_fixture_grow(&f->cluster, &f->fsms[CLUSTER_N]); \
-        munit_assert_int(rv_, ==, 0);                              \
-    }
-
 /* Add a new pristine server to the cluster, connected to all others. Then
  * submit a request to add it to the configuration as an idle server. */
-#define CLUSTER_ADD(REQ)                                               \
-    {                                                                  \
-        int rc;                                                        \
-        struct raft *new_raft;                                         \
-        CLUSTER_GROW;                                                  \
-        rc = raft_start(CLUSTER_RAFT(CLUSTER_N - 1));                  \
-        munit_assert_int(rc, ==, 0);                                   \
-        new_raft = CLUSTER_RAFT(CLUSTER_N - 1);                        \
-        rc = raft_add(CLUSTER_RAFT(CLUSTER_LEADER), REQ, new_raft->id, \
-                      new_raft->address, NULL);                        \
-        munit_assert_int(rc, ==, 0);                                   \
-    }
+/* #define CLUSTER_ADD(REQ)                                               \ */
+/*     {                                                                  \ */
+/*         int rc;                                                        \ */
+/*         struct raft *new_raft;                                         \ */
+/*         CLUSTER_GROW;                                                  \ */
+/*         rc = raft_start(CLUSTER_RAFT(CLUSTER_N - 1));                  \ */
+/*         munit_assert_int(rc, ==, 0);                                   \ */
+/*         new_raft = CLUSTER_RAFT(CLUSTER_N - 1);                        \ */
+/*         rc = raft_add(CLUSTER_RAFT(CLUSTER_LEADER), REQ, new_raft->id, \ */
+/*                       new_raft->address, NULL);                        \ */
+/*         munit_assert_int(rc, ==, 0);                                   \ */
+/*     } */
 
 /* Assign the given role to the server that was added last. */
 #define CLUSTER_ASSIGN(REQ, ROLE)                                              \
@@ -323,11 +355,13 @@
 /* Depose the current leader */
 #define CLUSTER_DEPOSE raft_fixture_depose(&f->cluster)
 
-/* Disconnect I from J. */
-#define CLUSTER_DISCONNECT(I, J) raft_fixture_disconnect(&f->cluster, I, J)
+/* Disconnect ID1 from ID2. */
+#define CLUSTER_DISCONNECT(ID1, ID2) \
+    test_cluster_disconnect(&f->cluster, ID1, ID2)
 
-/* Reconnect I to J. */
-#define CLUSTER_RECONNECT(I, J) raft_fixture_reconnect(&f->cluster, I, J)
+/* Reconnect ID1 to ID2. */
+#define CLUSTER_RECONNECT(ID1, ID2) \
+    test_cluster_reconnect(&f->cluster, ID1, ID2)
 
 /* Saturate the connection from I to J. */
 #define CLUSTER_SATURATE(I, J) raft_fixture_saturate(&f->cluster, I, J)
@@ -398,5 +432,143 @@
 void cluster_randomize_init(struct raft_fixture *f);
 void cluster_randomize(struct raft_fixture *f,
                        struct raft_fixture_event *event);
+
+/* Persisted state of a single node.
+ *
+ * This data is passed to raft_start() when starting a server, and is updated as
+ * the server makes progress. */
+struct test_disk
+{
+    raft_term term;
+    raft_id voted_for;
+    struct raft_snapshot_metadata *snapshot_metadata;
+    raft_index start_index;
+    struct raft_entry *entries;
+    unsigned n_entries;
+};
+
+/* Wrap a @raft instance and maintain disk and network state. */
+struct test_cluster;
+struct test_server
+{
+    struct test_disk disk;        /* Persisted data */
+    struct raft_tracer tracer;    /* Custom tracer */
+    struct raft raft;             /* Raft instance */
+    struct test_cluster *cluster; /* Parent cluster */
+    bool running;                 /* Whether the server is running */
+};
+
+/* Cluster of test raft servers instances with fake disk and network I/O. */
+struct test_cluster
+{
+    raft_time time;               /* Global time, for all servers */
+    struct raft_clock clock;      /* Exposes global time */
+    struct test_server **servers; /* Array of pointers to server objects */
+    unsigned n;                   /* Number of items in the servers array */
+    char trace[8192];             /* Captured trace messages */
+    void *operations[2];          /* Pending async operations */
+    void *disconnect[2];          /* Disconnected servers */
+};
+
+void test_cluster_setup(const MunitParameter params[], struct test_cluster *c);
+void test_cluster_tear_down(struct test_cluster *c);
+
+/* Return the global cluster time. */
+raft_time test_cluster_now(struct test_cluster *c);
+
+/* Compare the trace of all messages emitted by all servers with the given
+ * expected trace. If they don't match, print the last line which differs and
+ * return #false. */
+bool test_cluster_trace(struct test_cluster *c, const char *expected);
+
+/* Return the server with the given @id. */
+struct raft *test_cluster_get(struct test_cluster *c, raft_id id);
+
+/* Add @n new servers to the cluster. */
+void test_cluster_grow(struct test_cluster *c, unsigned n);
+
+/* Bootstrap the server with the given @id by setting the persisted term to #1
+ * and the first entry to a configuration of @n servers with consecutive IDs
+ * starting at 1, of which the first @n_voting ones will be voting servers. */
+void test_cluster_bootstrap(struct test_cluster *c,
+                            raft_id id,
+                            unsigned n,
+                            unsigned n_voting);
+
+/* Append an entry to the log persisted on disk of the server with the given
+ * @id. Must be called before starting the server. */
+void test_cluster_persist_entry(struct test_cluster *c,
+                                raft_id id,
+                                struct raft_entry *entry);
+
+/* Set the persisted term of the given server to the given value. */
+void test_cluster_persist_term(struct test_cluster *c,
+                               raft_id id,
+                               raft_term term);
+
+/* Step through the cluster state advancing the time to the minimum value needed
+ * for it to make progress (i.e. for a message to be delivered, for an I/O
+ * operation to complete or for a single time tick to occur).
+ *
+ * In particular, the following happens:
+ *
+ * 1. The #RAFT_IO event queues across all servers are consumed. All events of
+ *    type #RAFT_PERSIST_TERM_AND_VOTE are processed immediately, the relevant
+ *    disk state updated, and the @raft_done() callback invoked. All other I/O
+ *    events get pushed to the cluster #io queue. The #RAFT_PERSIST_ENTRIES
+ *    requests also get assigned a completion time.
+ *
+ * 2. If there are pending #raft_send_message events in the cluster #io queue,
+ *    the oldest one of them is picked and the relevant @raft_done() callback
+ *    gets fired. This simulates the completion of a socket write, which means
+ *    that the message has been sent. The receiver does not immediately receive
+ *    the message, as the message is propagating through the network. However
+ *    any memory associated with that #raft_send_message event can be released
+ *    (e.g. log entries). The #cluster assigns a delivery time to the message,
+ *    which mimics network latency. However, if the sender and the receiver are
+ *    currently disconnected, the request is simply dropped. If a @raft_done()
+ *    callback was fired, jump directly to 4. and skip 3.
+ *
+ * 3. If there are pending #raft_append disk write requests in the cluster #io
+ *    queue, the one with the lowest completion time is picked. If there
+ *    messages currently being transmitted, the one with the lowest delivery
+ *    time is picked. All servers are scanned, and the one with the lowest tick
+ *    expiration time is picked. The three times are compared and the lowest one
+ *    is picked. If a #raft_append request has completed, the relevant
+ *    @raft_done() callback will be invoked, if there's a network message to be
+ *    delivered, the receiver's @raft_recv() callback gets fired, if a timeout
+ *    has expired the relevant @raft_tick() callback will be invoked. Only one
+ *    event will be fired. If there is more than one event to fire, one of them
+ *    is picked according to the following rules: events for servers with lower
+ *    ID are fired first, tick events take precedence over disk events, and disk
+ *    events take precedence over network events.
+ *
+ * 4. The current cluster leader is detected (if any). When detecting the leader
+ *    the Election Safety property is checked: no servers can be in leader state
+ *    for the same term. The server in leader state with the highest term is
+ *    considered the current cluster leader, as long as it's "stable", i.e. it
+ *    has been acknowledged by all servers connected to it, and those servers
+ *    form a majority (this means that no further leader change can happen,
+ *    unless the network gets disrupted). If there is a stable leader and it has
+ *    not changed with respect to the previous call to @test_cluster_step(),
+ *    then the Leader Append-Only property is checked, by comparing its log with
+ *    a copy of it that was taken during the previous iteration.
+ *
+ * 5. If there is a stable leader, its current log is copied, in order to be
+ *    able to check the Leader Append-Only property at the next call.
+ *
+ * 6. If there is a stable leader, its commit index gets copied. */
+void test_cluster_step(struct test_cluster *c);
+
+/* Disconnect the server with @id1 from the one with @id2, so @id1 can't send
+ * messages to @id2. Inflight messages will be discarded as well. */
+void test_cluster_disconnect(struct test_cluster *c, raft_id id1, raft_id id2);
+
+/* Reconnect two previously disconnected servers. */
+void test_cluster_reconnect(struct test_cluster *c, raft_id id1, raft_id id2);
+
+/* Start the server with the given @id, using the current state persisted on its
+ * disk. */
+void test_cluster_start(struct test_cluster *c, raft_id id);
 
 #endif /* TEST_CLUSTER_H */
