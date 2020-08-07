@@ -18,41 +18,47 @@ libraft_la_SOURCES = \
   src/entry.c \
   src/err.c \
   src/heap.c \
+  src/io.c \
   src/log.c \
   src/membership.c \
+  src/prng.c \
   src/progress.c \
   src/raft.c \
   src/recv.c \
   src/recv_append_entries.c \
   src/recv_append_entries_result.c \
+  src/recv_install_snapshot.c \
   src/recv_request_vote.c \
   src/recv_request_vote_result.c \
-  src/recv_install_snapshot.c \
   src/recv_timeout_now.c \
   src/replication.c \
   src/snapshot.c \
   src/start.c \
   src/state.c \
+  src/store.c \
   src/syscall.c \
-  src/tick.c \
-  src/tracing.c
+  src/tick.c
 
 bin_PROGRAMS =
 
 check_PROGRAMS = \
-  test/unit/core
+  test/unit/core \
+  test/integration/core \
+  test/integration/store
+#  test/fuzzy/core
 TESTS = $(check_PROGRAMS)
 
 check_LTLIBRARIES = libtest.la
 
 libtest_la_CFLAGS = $(AM_CFLAGS) -DMUNIT_TEST_NAME_LEN=60 -Wno-unused-result -Wno-conversion
 libtest_la_SOURCES = \
+  test/lib/backend.c \
+  test/lib/cluster.c \
   test/lib/fault.c \
-  test/lib/fsm.c \
   test/lib/heap.c \
-  test/lib/munit.c \
-  test/lib/tracer.c \
-  test/lib/tcp.c
+  test/lib/munit.c
+  # test/lib/fsm.c \
+  # test/lib/tcp.c
 
 test_unit_core_SOURCES = \
   src/byte.c \
@@ -60,83 +66,79 @@ test_unit_core_SOURCES = \
   src/err.c \
   src/heap.c \
   src/log.c \
+  src/prng.c \
   test/unit/main_core.c \
   test/unit/test_byte.c \
   test/unit/test_configuration.c \
   test/unit/test_err.c \
   test/unit/test_log.c \
-  test/unit/test_queue.c
+  test/unit/test_queue.c \
+  test/unit/test_prng.c
 test_unit_core_CFLAGS = $(AM_CFLAGS) -Wno-conversion
 test_unit_core_LDADD = libtest.la
 
-if FIXTURE_ENABLED
-
-libraft_la_SOURCES += src/fixture.c
-raftinclude_HEADERS += include/raft/fixture.h
-
-check_PROGRAMS += \
-  test/integration/core \
-  test/fuzzy/core
-
-libtest_la_SOURCES += \
-  test/lib/cluster.c
-
 test_integration_core_SOURCES = \
   test/integration/main_core.c \
-  test/integration/test_apply.c \
+  test/integration/test_accept.c \
   test/integration/test_assign.c \
-  test/integration/test_barrier.c \
-  test/integration/test_bootstrap.c \
   test/integration/test_digest.c \
   test/integration/test_election.c \
-  test/integration/test_fixture.c \
   test/integration/test_heap.c \
   test/integration/test_membership.c \
-  test/integration/test_recover.c \
   test/integration/test_replication.c \
   test/integration/test_snapshot.c \
+  test/integration/test_start.c \
   test/integration/test_strerror.c \
   test/integration/test_tick.c \
-  test/integration/test_transfer.c \
-  test/integration/test_start.c
+  test/integration/test_transfer.c
+  # test/integration/test_barrier.c \
+  # test/integration/test_bootstrap.c \
+  # test/integration/test_fixture.c \
+  # test/integration/test_recover.c
 test_integration_core_CFLAGS = $(AM_CFLAGS) -Wno-conversion
 test_integration_core_LDFLAGS = -no-install
 test_integration_core_LDADD = libtest.la libraft.la
 
-test_fuzzy_core_SOURCES = \
-  test/fuzzy/main_core.c \
-  test/fuzzy/test_election.c \
-  test/fuzzy/test_liveness.c \
-  test/fuzzy/test_membership.c \
-  test/fuzzy/test_replication.c
-test_fuzzy_core_CFLAGS = $(AM_CFLAGS) -Wno-conversion
-test_fuzzy_core_LDFLAGS = -no-install
-test_fuzzy_core_LDADD = libtest.la libraft.la
+test_integration_store_SOURCES = \
+  test/integration/main_store.c \
+  test/integration/test_store_load.c
+test_integration_store_CFLAGS = $(AM_CFLAGS) -Wno-conversion
+test_integration_store_LDFLAGS = -no-install
+test_integration_store_LDADD = libtest.la libraft.la
 
-endif # FIXTURE_ENABLED
+
+# test_fuzzy_core_SOURCES = \
+#   test/fuzzy/main_core.c \
+#   test/fuzzy/test_election.c \
+#   test/fuzzy/test_liveness.c \
+#   test/fuzzy/test_membership.c \
+#   test/fuzzy/test_replication.c
+# test_fuzzy_core_CFLAGS = $(AM_CFLAGS) -Wno-conversion
+# test_fuzzy_core_LDFLAGS = -no-install
+# test_fuzzy_core_LDADD = libtest.la libraft.la
 
 if UV_ENABLED
 
 libraft_la_SOURCES += \
-  src/uv.c \
-  src/uv_append.c \
   src/uv_encoding.c \
-  src/uv_finalize.c \
   src/uv_fs.c \
-  src/uv_ip.c \
   src/uv_list.c \
   src/uv_metadata.c \
   src/uv_os.c \
-  src/uv_prepare.c \
-  src/uv_recv.c \
   src/uv_segment.c \
-  src/uv_send.c \
   src/uv_snapshot.c \
-  src/uv_tcp.c \
-  src/uv_tcp_listen.c \
-  src/uv_tcp_connect.c \
-  src/uv_truncate.c \
-  src/uv_writer.c
+  src/uv.c
+  # src/uv_append.c \
+  # src/uv_finalize.c \
+  # src/uv_ip.c \
+  # src/uv_prepare.c \
+  # src/uv_recv.c \
+  # src/uv_send.c \
+  # src/uv_tcp.c \
+  # src/uv_tcp_listen.c \
+  # src/uv_tcp_connect.c \
+  # src/uv_truncate.c \
+  # src/uv_writer.c
 libraft_la_LDFLAGS += $(UV_LIBS)
 
 raftinclude_HEADERS += include/raft/uv.h
@@ -155,7 +157,6 @@ test_unit_uv_SOURCES = \
   src/err.c \
   src/heap.c \
   src/syscall.c \
-  src/tracing.c \
   src/uv_fs.c \
   src/uv_os.c \
   src/uv_writer.c \
@@ -169,17 +170,17 @@ test_unit_uv_LDADD = libtest.la
 test_integration_uv_SOURCES = \
   test/integration/main_uv.c \
   test/integration/test_uv_init.c \
-  test/integration/test_uv_append.c \
-  test/integration/test_uv_bootstrap.c \
-  test/integration/test_uv_load.c \
-  test/integration/test_uv_recover.c \
-  test/integration/test_uv_recv.c \
-  test/integration/test_uv_send.c \
-  test/integration/test_uv_set_term.c \
-  test/integration/test_uv_tcp_connect.c \
-  test/integration/test_uv_tcp_listen.c \
-  test/integration/test_uv_snapshot_put.c \
-  test/integration/test_uv_truncate.c
+  test/integration/test_uv_load.c
+  # test/integration/test_uv_append.c \
+  # test/integration/test_uv_bootstrap.c \
+  # test/integration/test_uv_recover.c \
+  # test/integration/test_uv_recv.c \
+  # test/integration/test_uv_send.c \
+  # test/integration/test_uv_set_term.c \
+  # test/integration/test_uv_tcp_connect.c \
+  # test/integration/test_uv_tcp_listen.c \
+  # test/integration/test_uv_snapshot_put.c \
+  # test/integration/test_uv_truncate.c
 test_integration_uv_CFLAGS = $(AM_CFLAGS) -Wno-type-limits -Wno-conversion
 test_integration_uv_LDFLAGS = -no-install $(UV_LIBS)
 test_integration_uv_LDADD = libtest.la libraft.la
