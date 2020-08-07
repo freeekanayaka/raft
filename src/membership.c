@@ -4,6 +4,7 @@
 #include "assert.h"
 #include "configuration.h"
 #include "err.h"
+#include "io.h"
 #include "log.h"
 #include "progress.h"
 
@@ -11,7 +12,7 @@ int membershipCanChangeConfiguration(struct raft *r)
 {
     int rv;
 
-    if (r->state != RAFT_LEADER || r->transfer != NULL) {
+    if (r->state != RAFT_LEADER || r->transfer.id != 0) {
         rv = RAFT_NOTLEADER;
         goto err;
     }
@@ -52,7 +53,7 @@ bool membershipUpdateCatchUpRound(struct raft *r)
     unsigned server_index;
     raft_index match_index;
     raft_index last_index;
-    raft_time now = r->io->time(r->io);
+    raft_time now = r->clock->now(r->clock);
     raft_time round_duration;
     bool is_up_to_date;
     bool is_fast_enough;
@@ -159,16 +160,11 @@ int membershipRollback(struct raft *r)
     return 0;
 }
 
-void membershipLeadershipTransferInit(struct raft *r,
-                                      struct raft_transfer *req,
-                                      raft_id id,
-                                      raft_transfer_cb cb)
+void membershipLeadershipTransferInit(struct raft *r, raft_id id)
 {
-    req->cb = cb;
-    req->id = id;
-    req->start = r->io->time(r->io);
-    req->send.data = NULL;
-    r->transfer = req;
+    r->transfer.id = id;
+    r->transfer.start = r->clock->now(r->clock);
+    r->transfer.timeout_sent = false;
 }
 
 int membershipLeadershipTransferStart(struct raft *r)
@@ -176,31 +172,22 @@ int membershipLeadershipTransferStart(struct raft *r)
     const struct raft_server *server;
     struct raft_message message;
     int rv;
-    assert(r->transfer->send.data == NULL);
-    server = configurationGet(&r->configuration, r->transfer->id);
+    assert(r->transfer.id > 0);
+    server = configurationGet(&r->configuration, r->transfer.id);
     assert(server != NULL);
     message.type = RAFT_IO_TIMEOUT_NOW;
-    message.server_id = server->id;
-    message.server_address = server->address;
     message.timeout_now.term = r->current_term;
     message.timeout_now.last_log_index = logLastIndex(&r->log);
     message.timeout_now.last_log_term = logLastTerm(&r->log);
-    r->transfer->send.data = r;
-    rv = r->io->send(r->io, &r->transfer->send, &message, NULL);
+    rv = ioSendMessage(r, server->id, server->address, message);
     if (rv != 0) {
-        ErrMsgTransferf(r->io->errmsg, r->errmsg, "send timeout now to %llu",
-                        server->id);
         return rv;
     }
+    r->transfer.timeout_sent = true;
     return 0;
 }
 
 void membershipLeadershipTransferClose(struct raft *r)
 {
-    struct raft_transfer *req = r->transfer;
-    raft_transfer_cb cb = req->cb;
-    r->transfer = NULL;
-    if (cb != NULL) {
-        cb(req);
-    }
+    r->transfer.id = 0;
 }

@@ -37,10 +37,7 @@ int membershipUncommittedChange(struct raft *r,
 int membershipRollback(struct raft *r);
 
 /* Initialize the state of a leadership transfer request. */
-void membershipLeadershipTransferInit(struct raft *r,
-				      struct raft_transfer *req,
-                                      raft_id id,
-                                      raft_transfer_cb cb);
+void membershipLeadershipTransferInit(struct raft *r, raft_id id);
 
 /* Start the leadership transfer by sending a TimeoutNow message to the target
  * server. */
