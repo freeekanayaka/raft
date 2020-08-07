@@ -5,6 +5,8 @@
 
 #include "../include/raft.h"
 
+void electionUpdateRandomizedTimeout(struct raft *r);
+
 /* Reset the election_timer clock and set randomized_election_timeout to a
  * random value between election_timeout and 2 * election_timeout.
  *
