@@ -2,7 +2,7 @@
 #include <stdio.h>
 
 #include "../../src/err.h"
-#include "../lib/heap.h"
+#include "../../include/raft.h"
 #include "../lib/runner.h"
 
 /* An error messages which is 249 characters. */
