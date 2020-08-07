@@ -17,7 +17,8 @@ void snapshotDestroy(struct raft_snapshot *s);
  * The in-memory log must be empty when calling this function.
  *
  * If no error occurs, the memory of the snapshot object gets released. */
-int snapshotRestore(struct raft *r, struct raft_snapshot *snapshot);
+int snapshotRestore(struct raft *r,
+                    struct raft_snapshot_metadata *snapshot_metadata);
 
 /* Make a full deep copy of a snapshot object.
  *

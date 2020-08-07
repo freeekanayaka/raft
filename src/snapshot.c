@@ -19,7 +19,7 @@
 void snapshotClose(struct raft_snapshot *s)
 {
     unsigned i;
-    configurationClose(&s->configuration);
+    /* configurationClose(&s->configuration); */
     for (i = 0; i < s->n_bufs; i++) {
         raft_free(s->bufs[i].base);
     }
@@ -32,48 +32,47 @@ void snapshotDestroy(struct raft_snapshot *s)
     raft_free(s);
 }
 
-int snapshotRestore(struct raft *r, struct raft_snapshot *snapshot)
+int snapshotRestore(struct raft *r,
+                    struct raft_snapshot_metadata *snapshot_metadata)
 {
-    int rv;
+    /* int rv; */
 
-    assert(snapshot->n_bufs == 1);
-
-    rv = r->fsm->restore(r->fsm, &snapshot->bufs[0]);
-    if (rv != 0) {
-        tracef("restore snapshot %llu: %s", snapshot->index,
-               errCodeToString(rv));
-        return rv;
-    }
+    /* rv = r->fsm->restore(r->fsm, &snapshot->bufs[0]); */
+    /* if (rv != 0) { */
+    /*     tracef("restore snapshot %llu: %s", snapshot->index, */
+    /*            errCodeToString(rv)); */
+    /*     return rv; */
+    /* } */
 
     configurationClose(&r->configuration);
-    r->configuration = snapshot->configuration;
-    r->configuration_index = snapshot->configuration_index;
+    r->configuration = snapshot_metadata->configuration;
+    r->configuration_index = snapshot_metadata->configuration_index;
 
-    r->commit_index = snapshot->index;
-    r->last_applied = snapshot->index;
-    r->last_stored = snapshot->index;
+    r->commit_index = snapshot_metadata->index;
+    r->last_applied = snapshot_metadata->index;
+    r->last_stored = snapshot_metadata->index;
 
     /* Don't free the snapshot data buffer, as ownership has been trasfered to
      * the fsm. */
-    raft_free(snapshot->bufs);
+    /* raft_free(snapshot->bufs); */
 
     return 0;
 }
 
 int snapshotCopy(const struct raft_snapshot *src, struct raft_snapshot *dst)
 {
-    int rv;
+    /* int rv; */
     unsigned i;
     size_t size;
     uint8_t *cursor;
 
-    dst->term = src->term;
-    dst->index = src->index;
+    /* dst->term = src->term; */
+    /* dst->index = src->index; */
 
-    rv = configurationCopy(&src->configuration, &dst->configuration);
-    if (rv != 0) {
-        return rv;
-    }
+    /* rv = configurationCopy(&src->configuration, &dst->configuration); */
+    /* if (rv != 0) { */
+    /*     return rv; */
+    /* } */
 
     size = 0;
     for (i = 0; i < src->n_bufs; i++) {
