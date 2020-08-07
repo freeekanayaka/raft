@@ -34,8 +34,26 @@ bool progressIsUpToDate(struct raft *r, unsigned i);
 /* Whether a new AppendEntries or InstallSnapshot message should be sent to the
  * i'th server at this time.
  *
- * See the docstring of replicationProgress() for details about how the decision
- * is taken. */
+ * The rules to decide whether or not to send a message are:
+ *
+ * - If we have sent an InstallSnapshot RPC recently and we haven't yet received
+ *   a response, then don't send any new message.
+ *
+ * - If we are probing the follower (i.e. we haven't received a successful
+ *   response during the last heartbeat interval), then send a message only if
+ *   haven't sent any during the last heartbeat interval.
+ *
+ * - If we are pipelining entries to the follower, then send any new entries
+ *   haven't yet sent.
+ *
+ * If a message should be sent, the rules to decide what type of message to send
+ * and what it should contain are:
+ *
+ * - If we don't have anymore the first entry that should be sent to the
+ *   follower, then send an InstallSnapshot RPC with the last snapshot.
+ *
+ * - If we still have the first entry to send, then send all entries from that
+ *    index onward (possibly zero). */
 bool progressShouldReplicate(struct raft *r, unsigned i);
 
 /* Return the index of the next entry that should be sent to the i'th server. */
