@@ -37,4 +37,4 @@ example/cluster
 benchmark/os-disk-write
 tmp
 conftest*
-doc/build
+docs/build
