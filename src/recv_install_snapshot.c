@@ -2,17 +2,13 @@
 
 #include "assert.h"
 #include "convert.h"
+#include "io.h"
 #include "log.h"
 #include "recv.h"
 #include "replication.h"
 #include "tracing.h"
 
-/* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 static void installSnapshotSendCb(struct raft_io_send *req, int status)
 {
@@ -25,7 +21,9 @@ int recvInstallSnapshot(struct raft *r,
                         const char *address,
                         struct raft_install_snapshot *args)
 {
+    /*
     struct raft_io_send *req;
+    */
     struct raft_message message;
     struct raft_append_entries_result *result = &message.append_entries_result;
     int rv;
@@ -60,7 +58,8 @@ int recvInstallSnapshot(struct raft *r,
     if (rv != 0) {
         return rv;
     }
-    r->election_timer_start = r->io->time(r->io);
+    r->election_timer_start = r->clock->now(r->clock);
+    r->clock->timeout(r->clock, r->follower_state.randomized_election_timeout);
 
     rv = replicationInstallSnapshot(r, args, &result->rejected, &async);
     if (rv != 0) {
@@ -80,22 +79,29 @@ reply:
     result->term = r->current_term;
 
     /* Free the snapshot data. */
+    /*
     raft_configuration_close(&args->conf);
     raft_free(args->data.base);
+    */
 
     message.type = RAFT_IO_APPEND_ENTRIES_RESULT;
-    message.server_id = id;
-    message.server_address = address;
 
+    /*
     req = raft_malloc(sizeof *req);
     if (req == NULL) {
         return RAFT_NOMEM;
     }
     req->data = r;
+    */
 
+    rv = ioSendMessage(r, id, address, message);
+    /*
     rv = r->io->send(r->io, req, &message, installSnapshotSendCb);
+    */
     if (rv != 0) {
+        /*
         raft_free(req);
+        */
         return rv;
     }
 
