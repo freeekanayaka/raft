@@ -1,12 +1,6 @@
 #include "../lib/cluster.h"
 #include "../lib/runner.h"
 
-/******************************************************************************
- *
- * Fixture
- *
- *****************************************************************************/
-
 struct fixture
 {
     FIXTURE_CLUSTER;
@@ -15,15 +9,7 @@ struct fixture
 static void *setUp(const MunitParameter params[], MUNIT_UNUSED void *user_data)
 {
     struct fixture *f = munit_malloc(sizeof *f);
-    const char *n_voting_param = munit_parameters_get(params, "n_voting");
-    unsigned n = 3;
-    unsigned n_voting = n;
-    if (n_voting_param != NULL) {
-        n_voting = atoi(n_voting_param);
-    }
-    SETUP_CLUSTER(n);
-    CLUSTER_BOOTSTRAP_N_VOTING(n_voting);
-    CLUSTER_START;
+    SETUP_CLUSTER;
     return f;
 }
 
@@ -34,49 +20,57 @@ static void tearDown(void *data)
     free(f);
 }
 
-/******************************************************************************
- *
- * Assertions
- *
- *****************************************************************************/
-
-/* Assert the current value of the timer of the I'th raft instance */
-#define ASSERT_ELECTION_TIMER(I, MSECS)                                   \
-    {                                                                     \
-        struct raft *raft_ = CLUSTER_RAFT(I);                             \
-        munit_assert_int(                                                 \
-            raft_->io->time(raft_->io) - raft_->election_timer_start, ==, \
-            MSECS);                                                       \
+/* Assert the current value of the timer of the server with the given. ID */
+#define ASSERT_ELECTION_TIMER(ID, MSECS)                                       \
+    {                                                                          \
+        struct raft *_raft = CLUSTER_GET(ID);                                  \
+        munit_assert_int(                                                      \
+            _raft->clock->now(_raft->clock) - _raft->election_timer_start, ==, \
+            MSECS);                                                            \
     }
-
-/* Assert the current state of the I'th raft instance.  */
-#define ASSERT_STATE(I, STATE) munit_assert_int(CLUSTER_STATE(I), ==, STATE);
-
-/******************************************************************************
- *
- * Tick callback
- *
- *****************************************************************************/
 
 SUITE(tick)
 
-/* Internal timers are updated according to the given time delta. */
+/* Internal timers are updated as time elapses. */
 TEST(tick, electionTimer, setUp, tearDown, 0, NULL)
 {
     struct fixture *f = data;
-    (void)params;
+    CLUSTER_GROW(3);
+    CLUSTER_BOOTSTRAP(1 /* ID */, 3 /* N servers */, 3 /* N voting */);
+    CLUSTER_BOOTSTRAP(2 /* ID */, 3 /* N servers */, 3 /* N voting */);
+    CLUSTER_BOOTSTRAP(3 /* ID */, 3 /* N servers */, 3 /* N voting */);
 
-    CLUSTER_STEP;
-    ASSERT_ELECTION_TIMER(0, 100);
+    CLUSTER_START(1);
+    CLUSTER_START(2);
+    CLUSTER_START(3);
+    CLUSTER_TRACE(
+        "[   0] 1 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[   0] 2 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[   0] 3 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n");
 
-    CLUSTER_STEP;
-    ASSERT_ELECTION_TIMER(1, 100);
+    ASSERT_ELECTION_TIMER(1, 0);
+    ASSERT_ELECTION_TIMER(2, 0);
+    ASSERT_ELECTION_TIMER(3, 0);
 
-    CLUSTER_STEP;
+    CLUSTER_TRACE(
+        "[ 100] 1 > tick\n"
+        "           convert to candidate and start new election for term 2\n");
+
+    ASSERT_ELECTION_TIMER(1, 0);
     ASSERT_ELECTION_TIMER(2, 100);
+    ASSERT_ELECTION_TIMER(3, 100);
 
-    CLUSTER_STEP;
-    ASSERT_ELECTION_TIMER(0, 200);
+    CLUSTER_TRACE(
+        "[ 110] 2 > recv request vote from server 1\n"
+        "           remote term is higher (2 vs 1) -> bump term\n"
+        "           remote log equal or longer (1/1 vs 1/1) -> grant vote\n"
+        "[ 110] 3 > recv request vote from server 1\n"
+        "           remote term is higher (2 vs 1) -> bump term\n"
+        "           remote log equal or longer (1/1 vs 1/1) -> grant vote\n");
+
+    ASSERT_ELECTION_TIMER(1, 10);
+    ASSERT_ELECTION_TIMER(2, 0);
+    ASSERT_ELECTION_TIMER(3, 0);
 
     return MUNIT_OK;
 }
@@ -87,104 +81,152 @@ TEST(tick, electionTimer, setUp, tearDown, 0, NULL)
 TEST(tick, candidate, setUp, tearDown, 0, NULL)
 {
     struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(0);
-    (void)params;
+    struct raft *raft;
+    CLUSTER_GROW(2);
 
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout);
+    CLUSTER_BOOTSTRAP(1 /* ID */, 2 /* N servers */, 2 /* N voting */);
+    CLUSTER_BOOTSTRAP(2 /* ID */, 2 /* N servers */, 2 /* N voting */);
+
+    /* Server 1 becomes leader */
+    CLUSTER_START(1 /* ID */);
+    CLUSTER_START(2 /* ID */);
+    CLUSTER_TRACE(
+        "[   0] 1 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[   0] 2 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[ 100] 1 > tick\n"
+        "           convert to candidate and start new election for term 2\n"
+        "[ 110] 2 > recv request vote from server 1\n"
+        "           remote term is higher (2 vs 1) -> bump term\n"
+        "           remote log equal or longer (1/1 vs 1/1) -> grant vote\n"
+        "[ 120] 1 > recv request vote result from server 2\n"
+        "           votes quorum reached -> convert to leader\n"
+        "           persist 1 entries with first index 2\n"
+        "           probe server 2 sending 1 entries with first index 2\n");
+
+    /* Kill server 1, eventually server 2 converts to candidate. */
+    CLUSTER_KILL(1);
+
+    CLUSTER_TRACE(
+        "[ 240] 2 > tick\n"
+        "           convert to candidate and start new election for term 3\n");
+
+    raft = CLUSTER_GET(2);
 
     /* The term has been incremeted. */
-    munit_assert_int(raft->current_term, ==, 2);
+    munit_assert_int(raft->current_term, ==, 3);
 
     /* We have voted for ouselves. */
-    munit_assert_int(raft->voted_for, ==, 1);
+    munit_assert_int(raft->voted_for, ==, 2);
 
     /* We are candidate */
-    ASSERT_STATE(0, RAFT_CANDIDATE);
+    munit_assert_int(raft_state(raft), ==, RAFT_CANDIDATE);
 
     /* The votes array is initialized */
     munit_assert_ptr_not_null(raft->candidate_state.votes);
-    munit_assert_true(raft->candidate_state.votes[0]);
-    munit_assert_false(raft->candidate_state.votes[1]);
+    munit_assert_false(raft->candidate_state.votes[0]);
+    munit_assert_true(raft->candidate_state.votes[1]);
 
     return MUNIT_OK;
 }
-
-/* If the election timeout has not elapsed, stay follower. */
-TEST(tick, electionTimerNotExpired, setUp, tearDown, 0, NULL)
-{
-    struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(0);
-    (void)params;
-
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout - 100);
-    ASSERT_STATE(0, RAFT_FOLLOWER);
-
-    return MUNIT_OK;
-}
-
-static char *elapse_non_voter_n_voting[] = {"1", NULL};
-
-static MunitParameterEnum elapse_non_voter_params[] = {
-    {"n_voting", elapse_non_voter_n_voting},
-    {NULL, NULL},
-};
 
 /* If the election timeout has elapsed, but we're not voters, stay follower. */
-TEST(tick, not_voter, setUp, tearDown, 0, elapse_non_voter_params)
+TEST(tick, notVoter, setUp, tearDown, 0, NULL)
 {
     struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(1);
-    (void)params;
+    // struct raft *raft;
+    CLUSTER_GROW(2);
 
-    /* Prevent the timer of the first server from expiring. */
-    raft_fixture_set_randomized_election_timeout(&f->cluster, 0, 2000);
-    raft_set_election_timeout(CLUSTER_RAFT(0), 2000);
+    CLUSTER_BOOTSTRAP(1 /* ID */, 2 /* N servers */, 1 /* N voting */);
+    CLUSTER_BOOTSTRAP(2 /* ID */, 2 /* N servers */, 1 /* N voting */);
 
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout + 100);
-    ASSERT_STATE(1, RAFT_FOLLOWER);
+    /* Server 1 self-elects itself. */
+    CLUSTER_START(1 /* ID */);
+    CLUSTER_START(2 /* ID */);
+    CLUSTER_TRACE(
+        "[   0] 1 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "           self elect and convert to leader\n"
+        "[   0] 2 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n");
+
+    /* Kill server 1, server 2 stays follower when the election timeout
+     * expires. */
+    CLUSTER_KILL(1);
+
+    munit_assert_int(raft_state(CLUSTER_GET(2)), ==, RAFT_FOLLOWER);
 
     return MUNIT_OK;
 }
 
 /* If we're leader election timeout elapses without hearing from a majority of
  * the cluster, step down. */
-TEST(tick, no_contact, setUp, tearDown, 0, NULL)
+TEST(tick, noContact, setUp, tearDown, 0, NULL)
 {
     struct fixture *f = data;
-    (void)params;
+    CLUSTER_GROW(2);
 
-    CLUSTER_ELECT(0);
-    CLUSTER_SATURATE_BOTHWAYS(0, 1);
-    CLUSTER_SATURATE_BOTHWAYS(0, 2);
+    CLUSTER_BOOTSTRAP(1 /* ID */, 2 /* N servers */, 2 /* N voting */);
+    CLUSTER_BOOTSTRAP(2 /* ID */, 2 /* N servers */, 2 /* N voting */);
 
-    /* Wait for the leader to step down. */
-    CLUSTER_STEP_UNTIL_STATE_IS(0, RAFT_FOLLOWER, 2000);
+    /* Server 1 becomes leader */
+    CLUSTER_START(1 /* ID */);
+    CLUSTER_START(2 /* ID */);
+    CLUSTER_TRACE(
+        "[   0] 1 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[   0] 2 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[ 100] 1 > tick\n"
+        "           convert to candidate and start new election for term 2\n"
+        "[ 110] 2 > recv request vote from server 1\n"
+        "           remote term is higher (2 vs 1) -> bump term\n"
+        "           remote log equal or longer (1/1 vs 1/1) -> grant vote\n"
+        "[ 120] 1 > recv request vote result from server 2\n"
+        "           votes quorum reached -> convert to leader\n"
+        "           persist 1 entries with first index 2\n"
+        "           probe server 2 sending 1 entries with first index 2\n");
+
+    /* Kill server 2, eventually server 1 steps down. */
+    CLUSTER_KILL(2);
+    CLUSTER_TRACE(
+        "[ 130] 1 > done persist 1 entries with first index 2 (status 0)\n"
+        "           replication quorum not reached for index 2\n"
+        "[ 160] 1 > tick\n"
+        "           probe server 2 sending 1 entries with first index 2\n"
+        "[ 200] 1 > tick\n"
+        "           probe server 2 sending 1 entries with first index 2\n"
+        "[ 240] 1 > tick\n"
+        "           unable to contact majority of cluster -> step down\n");
+
+    munit_assert_int(raft_state(CLUSTER_GET(1)), ==, RAFT_FOLLOWER);
 
     return MUNIT_OK;
 }
 
 /* If we're candidate and the election timeout has elapsed, start a new
  * election. */
-TEST(tick, new_election, setUp, tearDown, 0, NULL)
+TEST(tick, newElection, setUp, tearDown, 0, NULL)
 {
     struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(0);
+    struct raft *raft;
+    CLUSTER_GROW(2);
 
-    (void)params;
-
-    CLUSTER_SATURATE_BOTHWAYS(0, 1);
-    CLUSTER_SATURATE_BOTHWAYS(0, 2);
+    CLUSTER_BOOTSTRAP(1 /* ID */, 2 /* N servers */, 2 /* N voting */);
+    CLUSTER_BOOTSTRAP(2 /* ID */, 2 /* N servers */, 2 /* N voting */);
 
     /* Become candidate */
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout);
+    CLUSTER_START(1 /* ID */);
+    CLUSTER_START(2 /* ID */);
+    CLUSTER_TRACE(
+        "[   0] 1 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[   0] 2 > term 1, vote 0, no snapshot, entries 1/1 to 1/1\n"
+        "[ 100] 1 > tick\n"
+        "           convert to candidate and start new election for term 2\n");
 
-    /* Expire the election timeout */
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->candidate_state.randomized_election_timeout);
+    /* Kill server 2 so server 1 can't win the election. */
+    CLUSTER_KILL(2);
+
+    CLUSTER_TRACE(
+        "[ 270] 1 > tick\n"
+        "           stay candidate and start new election for term 3\n");
+
+    raft = CLUSTER_GET(1);
 
     /* The term has been incremeted and saved to stable store. */
     munit_assert_int(raft->current_term, ==, 3);
@@ -193,69 +235,12 @@ TEST(tick, new_election, setUp, tearDown, 0, NULL)
     munit_assert_int(raft->voted_for, ==, 1);
 
     /* We are still candidate */
-    ASSERT_STATE(0, RAFT_CANDIDATE);
+    munit_assert_int(raft_state(raft), ==, RAFT_CANDIDATE);
 
     /* The votes array is initialized */
     munit_assert_ptr_not_null(raft->candidate_state.votes);
     munit_assert_true(raft->candidate_state.votes[0]);
     munit_assert_false(raft->candidate_state.votes[1]);
-
-    return MUNIT_OK;
-}
-
-/* If the election timeout has not elapsed, stay candidate. */
-TEST(tick, during_election, setUp, tearDown, 0, NULL)
-{
-    struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(0);
-    (void)params;
-
-    CLUSTER_SATURATE_BOTHWAYS(0, 1);
-    CLUSTER_SATURATE_BOTHWAYS(0, 2);
-
-    /* Become candidate */
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout);
-
-    /* Make some time elapse, but not enough to trigger the timeout */
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->candidate_state.randomized_election_timeout - 100);
-
-    /* We are still candidate at the same term */
-    ASSERT_STATE(0, RAFT_CANDIDATE);
-    munit_assert_int(raft->current_term, ==, 2);
-
-    return MUNIT_OK;
-}
-
-static char *elapse_request_vote_only_to_voters_n_voting[] = {"2", NULL};
-
-static MunitParameterEnum elapse_request_vote_only_to_voters_params[] = {
-    {"n_voting", elapse_request_vote_only_to_voters_n_voting},
-    {NULL, NULL},
-};
-
-/* Vote requests are sent only to voting servers. */
-TEST(tick,
-     request_vote_only_to_voters,
-     setUp,
-     tearDown,
-     0,
-     elapse_request_vote_only_to_voters_params)
-{
-    struct fixture *f = data;
-    struct raft *raft = CLUSTER_RAFT(0);
-    (void)params;
-
-    CLUSTER_SATURATE_BOTHWAYS(0, 1);
-    CLUSTER_SATURATE_BOTHWAYS(0, 2);
-
-    /* Become candidate */
-    CLUSTER_STEP_UNTIL_ELAPSED(
-        raft->follower_state.randomized_election_timeout);
-
-    /* We have sent vote requests only to the voting server */
-    //__assert_request_vote(f, 2, 2, 1, 1);
 
     return MUNIT_OK;
 }
