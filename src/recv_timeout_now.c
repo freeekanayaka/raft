@@ -8,11 +8,7 @@
 #include "tracing.h"
 
 /* Set to 1 to enable tracing. */
-#if 0
-#define tracef(...) Tracef(r->tracer, __VA_ARGS__)
-#else
-#define tracef(...)
-#endif
+#define tracef(...) Tracef(r->tracer, "  " __VA_ARGS__)
 
 int recvTimeoutNow(struct raft *r,
                    const raft_id id,
@@ -34,6 +30,7 @@ int recvTimeoutNow(struct raft *r,
     /* Ignore the request if we are not voters. */
     local_server = configurationGet(&r->configuration, r->id);
     if (local_server == NULL || local_server->role != RAFT_VOTER) {
+        tracef("not voter -> ignore");
         return 0;
     }
 
@@ -41,6 +38,7 @@ int recvTimeoutNow(struct raft *r,
      * leader. */
     if (r->state != RAFT_FOLLOWER ||
         r->follower_state.current_leader.id != id) {
+        tracef("not follower or different leader -> ignore");
         return 0;
     }
 
@@ -51,6 +49,8 @@ int recvTimeoutNow(struct raft *r,
         return rv;
     }
     if (match < 0) {
+        tracef("local term %llu higher than %llu -> ignore", r->current_term,
+               args->term);
         return 0;
     }
 
@@ -59,10 +59,13 @@ int recvTimeoutNow(struct raft *r,
     local_last_term = logLastTerm(&r->log);
     if (local_last_index != args->last_log_index ||
         local_last_term != args->last_log_term) {
+        tracef("local log not up-to-date -> ignore");
         return 0;
     }
 
     /* Convert to candidate and start a new election. */
+    tracef("convert to candidate and start new election for term %llu",
+           r->current_term + 1);
     rv = convertToCandidate(r, true /* disrupt leader */);
     if (rv != 0) {
         return rv;
