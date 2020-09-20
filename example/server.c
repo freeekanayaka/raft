@@ -1,6 +1,5 @@
 #include <assert.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "../include/raft.h"
@@ -19,6 +18,7 @@
  *
  ********************************************************************/
 
+/*
 struct Fsm
 {
     unsigned long long count;
@@ -88,6 +88,7 @@ static void FsmClose(struct raft_fsm *f)
         raft_free(f->data);
     }
 }
+*/
 
 /********************************************************************
  *
@@ -107,7 +108,7 @@ struct Server
     const char *dir;                    /* Data dir of UV I/O backend. */
     struct raft_uv_transport transport; /* UV I/O backend transport. */
     struct raft_io io;                  /* UV I/O backend. */
-    struct raft_fsm fsm;                /* Sample application FSM. */
+    /* struct raft_fsm fsm; */          /* Sample application FSM. */
     unsigned id;                        /* Raft instance ID. */
     char address[64];                   /* Raft instance address. */
     struct raft raft;                   /* Raft instance. */
@@ -115,6 +116,7 @@ struct Server
     ServerCloseCb close_cb;             /* Optional close callback. */
 };
 
+/*
 static void serverRaftCloseCb(struct raft *raft)
 {
     struct Server *s = raft->data;
@@ -134,12 +136,14 @@ static void serverTransferCb(struct raft_transfer *req)
     raft_leader(&s->raft, &id, &address);
     raft_close(&s->raft, serverRaftCloseCb);
 }
+*/
 
 /* Final callback in the shutdown sequence, invoked after the timer handle has
  * been closed. */
 static void serverTimerCloseCb(struct uv_handle_s *handle)
 {
     struct Server *s = handle->data;
+    /*
     if (s->raft.data != NULL) {
         if (s->raft.state == RAFT_LEADER) {
             int rv;
@@ -150,6 +154,11 @@ static void serverTimerCloseCb(struct uv_handle_s *handle)
         }
         raft_close(&s->raft, serverRaftCloseCb);
     }
+    */
+    raft_close(&s->raft);
+    if (s->close_cb != NULL) {
+        s->close_cb(s);
+    }
 }
 
 /* Initialize the example server struct, without starting it yet. */
@@ -158,16 +167,13 @@ static int ServerInit(struct Server *s,
                       const char *dir,
                       unsigned id)
 {
+    /*
     struct raft_configuration configuration;
-    struct timespec now;
     unsigned i;
+    */
     int rv;
 
     memset(s, 0, sizeof *s);
-
-    /* Seed the random generator */
-    timespec_get(&now, TIME_UTC);
-    srandom((unsigned)(now.tv_nsec ^ now.tv_sec));
 
     s->loop = loop;
 
@@ -179,26 +185,6 @@ static int ServerInit(struct Server *s,
     }
     s->timer.data = s;
 
-    /* Initialize the TCP-based RPC transport. */
-    rv = raft_uv_tcp_init(&s->transport, s->loop);
-    if (rv != 0) {
-        goto err;
-    }
-
-    /* Initialize the libuv-based I/O backend. */
-    rv = raft_uv_init(&s->io, s->loop, dir, &s->transport);
-    if (rv != 0) {
-        Logf(s->id, "raft_uv_init(): %s", s->io.errmsg);
-        goto err_after_uv_tcp_init;
-    }
-
-    /* Initialize the finite state machine. */
-    rv = FsmInit(&s->fsm);
-    if (rv != 0) {
-        Logf(s->id, "FsmInit(): %s", raft_strerror(rv));
-        goto err_after_uv_init;
-    }
-
     /* Save the server ID. */
     s->id = id;
 
@@ -206,14 +192,43 @@ static int ServerInit(struct Server *s,
     sprintf(s->address, "127.0.0.1:900%d", id);
 
     /* Initialize and start the engine, using the libuv-based I/O backend. */
-    rv = raft_init(&s->raft, &s->io, &s->fsm, id, s->address);
+    rv = raft_init(&s->raft, id, s->address);
     if (rv != 0) {
         Logf(s->id, "raft_init(): %s", raft_errmsg(&s->raft));
-        goto err_after_fsm_init;
+        goto err_after_timer_init;
     }
+    /*
     s->raft.data = s;
+    */
+
+    /* Initialize the TCP-based RPC transport. */
+    /*
+    rv = raft_uv_tcp_init(&s->transport, s->loop);
+    if (rv != 0) {
+        goto err;
+    }
+    */
+
+    /* Initialize the libuv-based I/O backend. */
+    /*
+    rv = raft_uv_init(&s->io, s->loop, dir, &s->transport);
+    if (rv != 0) {
+        Logf(s->id, "raft_uv_init(): %s", s->io.errmsg);
+        goto err_after_uv_tcp_init;
+    }
+    */
+
+    /* Initialize the finite state machine. */
+    /*
+    rv = FsmInit(&s->fsm);
+    if (rv != 0) {
+        Logf(s->id, "FsmInit(): %s", raft_strerror(rv));
+        goto err_after_uv_init;
+    }
+    */
 
     /* Bootstrap the initial configuration if needed. */
+    /*
     raft_configuration_init(&configuration);
     for (i = 0; i < N_SERVERS; i++) {
         char address[64];
@@ -231,15 +246,19 @@ static int ServerInit(struct Server *s,
         goto err_after_configuration_init;
     }
     raft_configuration_close(&configuration);
+    */
 
+    /*
     raft_set_snapshot_threshold(&s->raft, 64);
     raft_set_snapshot_trailing(&s->raft, 16);
     raft_set_pre_vote(&s->raft, true);
+    */
 
     s->transfer.data = s;
 
     return 0;
 
+/*
 err_after_configuration_init:
     raft_configuration_close(&configuration);
 err_after_fsm_init:
@@ -248,6 +267,9 @@ err_after_uv_init:
     raft_uv_close(&s->io);
 err_after_uv_tcp_init:
     raft_uv_tcp_close(&s->transport);
+*/
+err_after_timer_init:
+    uv_close((struct uv_handle_s *)&s->timer, NULL);
 err:
     return rv;
 }
@@ -273,6 +295,7 @@ static void serverApplyCb(struct raft_apply *req, int status, void *result)
 }
 
 /* Called periodically every APPLY_RATE milliseconds. */
+/*
 static void serverTimerCb(uv_timer_t *timer)
 {
     struct Server *s = timer->data;
@@ -306,14 +329,18 @@ static void serverTimerCb(uv_timer_t *timer)
         return;
     }
 }
+*/
 
 /* Start the example server. */
 static int ServerStart(struct Server *s)
 {
+    /*
     int rv;
+    */
 
     Log(s->id, "starting");
 
+    /*
     rv = raft_start(&s->raft);
     if (rv != 0) {
         Logf(s->id, "raft_start(): %s", raft_errmsg(&s->raft));
@@ -324,11 +351,14 @@ static int ServerStart(struct Server *s)
         Logf(s->id, "uv_timer_start(): %s", uv_strerror(rv));
         goto err;
     }
+    */
 
     return 0;
 
+    /*
 err:
     return rv;
+    */
 }
 
 /* Release all resources used by the example server. */
@@ -395,17 +425,11 @@ int main(int argc, char *argv[])
         goto err;
     }
 
-    /* Initialize the example server. */
-    rv = ServerInit(&server, &loop, dir, id);
-    if (rv != 0) {
-        goto err_after_server_init;
-    }
-
     /* Add a signal handler to stop the example server upon SIGINT. */
     rv = uv_signal_init(&loop, &sigint);
     if (rv != 0) {
         Logf(id, "uv_signal_init(): %s", uv_strerror(rv));
-        goto err_after_server_init;
+        goto err_after_loop_init;
     }
     sigint.data = &server;
     rv = uv_signal_start(&sigint, mainSigintCb, SIGINT);
@@ -414,10 +438,16 @@ int main(int argc, char *argv[])
         goto err_after_signal_init;
     }
 
+    /* Initialize the example server. */
+    rv = ServerInit(&server, &loop, dir, id);
+    if (rv != 0) {
+        goto err_after_signal_init;
+    }
+
     /* Start the server. */
     rv = ServerStart(&server);
     if (rv != 0) {
-        goto err_after_signal_init;
+        goto err_after_server_init;
     }
 
     /* Run the event loop until we receive SIGINT. */
@@ -430,11 +460,12 @@ int main(int argc, char *argv[])
 
     return rv;
 
-err_after_signal_init:
-    uv_close((struct uv_handle_s *)&sigint, NULL);
 err_after_server_init:
     ServerClose(&server, NULL);
+err_after_signal_init:
+    uv_close((struct uv_handle_s *)&sigint, NULL);
     uv_run(&loop, UV_RUN_DEFAULT);
+err_after_loop_init:
     uv_loop_close(&loop);
 err:
     return rv;
