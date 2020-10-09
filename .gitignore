@@ -23,6 +23,7 @@ stamp-h1
 test/unit/core
 test/unit/uv
 test/integration/core
+test/integration/backend
 test/integration/uv
 test/fuzzy/core
 test/*/*.log
