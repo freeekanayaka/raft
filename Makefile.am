@@ -10,6 +10,10 @@ lib_LTLIBRARIES = libraft.la
 libraft_la_CFLAGS = $(AM_CFLAGS) -fvisibility=hidden
 libraft_la_LDFLAGS = -version-info 0:7:0
 libraft_la_SOURCES = \
+  src/backend.c \
+  src/backend_filenames.c \
+  src/backend_metadata.c \
+  src/backend_snapshot.c \
   src/byte.c \
   src/client.c \
   src/configuration.c \
@@ -34,8 +38,6 @@ libraft_la_SOURCES = \
   src/replication.c \
   src/snapshot.c \
   src/start.c \
-  src/state.c \
-  src/store.c \
   src/syscall.c \
   src/tick.c
 
@@ -44,7 +46,7 @@ bin_PROGRAMS =
 check_PROGRAMS = \
   test/unit/core \
   test/integration/core \
-  test/integration/store
+  test/integration/backend
 #  test/fuzzy/core
 TESTS = $(check_PROGRAMS)
 
@@ -52,8 +54,8 @@ check_LTLIBRARIES = libtest.la
 
 libtest_la_CFLAGS = $(AM_CFLAGS) -DMUNIT_TEST_NAME_LEN=60 -Wno-unused-result -Wno-conversion
 libtest_la_SOURCES = \
-  test/lib/backend.c \
   test/lib/cluster.c \
+  test/lib/driver.c \
   test/lib/fault.c \
   test/lib/heap.c \
   test/lib/munit.c
@@ -99,12 +101,12 @@ test_integration_core_CFLAGS = $(AM_CFLAGS) -Wno-conversion
 test_integration_core_LDFLAGS = -no-install
 test_integration_core_LDADD = libtest.la libraft.la
 
-test_integration_store_SOURCES = \
-  test/integration/main_store.c \
-  test/integration/test_store_load.c
-test_integration_store_CFLAGS = $(AM_CFLAGS) -Wno-conversion
-test_integration_store_LDFLAGS = -no-install
-test_integration_store_LDADD = libtest.la libraft.la
+test_integration_backend_SOURCES = \
+  test/integration/main_backend.c \
+  test/integration/test_backend_load.c
+test_integration_backend_CFLAGS = $(AM_CFLAGS) -Wno-conversion
+test_integration_backend_LDFLAGS = -no-install
+test_integration_backend_LDADD = libtest.la libraft.la
 
 
 # test_fuzzy_core_SOURCES = \
