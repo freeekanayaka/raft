@@ -68,6 +68,7 @@ int recvInstallSnapshot(struct raft *r,
     }
 
     if (async) {
+        r->profile.snapshots += args->data.len;
         return 0;
     }
 

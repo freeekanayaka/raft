@@ -47,7 +47,8 @@ static struct raft_heap defaultHeap = {
     defaultCalloc,       /* calloc */
     defaultRealloc,      /* realloc */
     defaultAlignedAlloc, /* aligned_alloc */
-    defaultAlignedFree   /* aligned_free */
+    defaultAlignedFree,  /* aligned_free */
+    NULL,
 };
 
 static struct raft_heap *currentHeap = &defaultHeap;
@@ -103,6 +104,11 @@ void *raft_aligned_alloc(size_t alignment, size_t size)
 void raft_aligned_free(size_t alignment, void *ptr)
 {
     currentHeap->aligned_free(currentHeap->data, alignment, ptr);
+}
+
+int raft_msize(void *ptr)
+{
+    return currentHeap->msize(currentHeap->data, ptr);
 }
 
 void raft_heap_set(struct raft_heap *heap)

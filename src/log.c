@@ -248,6 +248,11 @@ static int refsInit(struct raft_log *l,
         }
     };
 
+    l->profile = 0;
+    l->missed_remove_suffix = 0;
+    l->missed_remove_prefix = 0;
+    l->missed_release = 0;
+
     return RAFT_NOMEM;
 }
 
@@ -501,6 +506,7 @@ int logAppend(struct raft_log *l,
     entry->type = type;
     entry->buf = *buf;
     entry->batch = batch;
+    l->profile += entry->buf.len;
 
     l->back += 1;
     l->back = l->back % l->size;
@@ -755,12 +761,16 @@ void logRelease(struct raft_log *l,
             if (entries[i].batch == NULL) {
                 if (entry->buf.base != NULL) {
                     raft_free(entries[i].buf.base);
+                    l->profile -= entry->buf.len;
                 }
             } else {
                 if (entry->batch != batch) {
                     if (!isBatchReferenced(l, entry->batch)) {
                         batch = entry->batch;
+                        l->profile -= raft_msize(batch);
                         raft_free(batch);
+                    } else {
+                        l->missed_release++;
                     }
                 }
             }
@@ -786,15 +796,22 @@ static void clearIfEmpty(struct raft_log *l)
 }
 
 /* Destroy an entry, possibly releasing the memory of its buffer. */
-static void destroyEntry(struct raft_log *l, struct raft_entry *entry)
+static void destroyEntry(struct raft_log *l,
+                         struct raft_entry *entry,
+                         bool *missed)
 {
+    *missed = false;
     if (entry->batch == NULL) {
         if (entry->buf.base != NULL) {
             raft_free(entry->buf.base);
+            l->profile -= entry->buf.len;
         }
     } else {
         if (!isBatchReferenced(l, entry->batch)) {
+            l->profile -= raft_msize(entry->batch);
             raft_free(entry->batch);
+        } else {
+            *missed = true;
         }
     }
 }
@@ -830,7 +847,11 @@ static void removeSuffix(struct raft_log *l,
         unref = refsDecr(l, entry->term, start + n - i - 1);
 
         if (unref && destroy) {
-            destroyEntry(l, entry);
+            bool missed;
+            destroyEntry(l, entry, &missed);
+            if (missed) {
+                l->missed_remove_suffix++;
+            }
         }
     }
 
@@ -879,7 +900,11 @@ static void removePrefix(struct raft_log *l, const raft_index index)
         unref = refsDecr(l, entry->term, l->offset);
 
         if (unref) {
-            destroyEntry(l, entry);
+            bool missed;
+            destroyEntry(l, entry, &missed);
+            if (missed) {
+                l->missed_remove_prefix++;
+            }
         }
     }
 

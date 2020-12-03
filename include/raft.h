@@ -230,6 +230,10 @@ struct raft_log
         raft_index last_index; /* Snapshot replaces all entries up to here. */
         raft_term last_term;   /* Term of last index. */
     } snapshot;
+    int profile;
+    int missed_remove_suffix;
+    int missed_remove_prefix;
+    int missed_release;
 };
 
 /**
@@ -699,6 +703,12 @@ struct raft
      * being promoted to voter. */
     unsigned max_catch_up_rounds;
     unsigned max_catch_up_round_duration;
+
+    struct
+    {
+        int entries;
+        int snapshots;
+    } profile;
 };
 
 RAFT_API int raft_init(struct raft *r,
@@ -899,6 +909,13 @@ struct raft_change
     raft_change_cb cb;
 };
 
+RAFT_API void raft_stats(struct raft *r,
+                         size_t *log_size,
+                         size_t *log_n,
+                         size_t *log_refs,
+                         size_t *log_lost,
+                         raft_index *log_end);
+
 /**
  * Add a new server to the cluster configuration. Its initial role will be
  * #RAFT_SPARE.
@@ -924,6 +941,11 @@ RAFT_API int raft_assign(struct raft *r,
 /**
  * Remove the given server from the cluster configuration.
  */
+RAFT_API int raft_remove(struct raft *r,
+                         struct raft_change *req,
+                         raft_id id,
+                         raft_change_cb cb);
+
 RAFT_API int raft_remove(struct raft *r,
                          struct raft_change *req,
                          raft_id id,
@@ -979,6 +1001,7 @@ struct raft_heap
     void *(*realloc)(void *data, void *ptr, size_t size);
     void *(*aligned_alloc)(void *data, size_t alignment, size_t size);
     void (*aligned_free)(void *data, size_t alignment, void *ptr);
+    int (*msize)(void *data, void *ptr);
 };
 
 RAFT_API void *raft_malloc(size_t size);
@@ -987,6 +1010,7 @@ RAFT_API void *raft_calloc(size_t nmemb, size_t size);
 RAFT_API void *raft_realloc(void *ptr, size_t size);
 RAFT_API void *raft_aligned_alloc(size_t alignment, size_t size);
 RAFT_API void raft_aligned_free(size_t alignment, void *ptr);
+RAFT_API int raft_msize(void *ptr);
 
 /**
  * Use a custom dynamic memory allocator.

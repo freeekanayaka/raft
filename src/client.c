@@ -17,6 +17,42 @@
 #define tracef(...)
 #endif
 
+void raft_stats(struct raft *r,
+                size_t *log_size,
+                size_t *log_n,
+                size_t *log_refs,
+                size_t *log_lost,
+                raft_index *log_end)
+{
+    struct raft_log *l = &r->log;
+    size_t i;
+    *log_size = r->log.profile;
+    *log_n = logNumEntries(&r->log);
+    *log_refs = 0;
+    *log_lost = 0;
+    *log_end = logLastIndex(&r->log);
+    for (i = 0; i < l->refs_size; i++) {
+        if (l->refs[i].count > 0) {
+            const struct raft_entry *entry;
+            *log_refs += 1;
+            entry = logGet(l, l->refs[i].index);
+            if (entry == NULL || entry->term != l->refs[i].term) {
+                *log_lost += 1;
+            }
+            struct raft_entry_ref *next = l->refs[i].next;
+            while (next != NULL) {
+                assert(next->count > 0);
+                *log_refs += 1;
+                entry = logGet(l, next->index);
+                if (entry == NULL || entry->term != next->term) {
+                    *log_lost += 1;
+                }
+                next = next->next;
+            }
+        }
+    }
+}
+
 int raft_apply(struct raft *r,
                struct raft_apply *req,
                const struct raft_buffer bufs[],

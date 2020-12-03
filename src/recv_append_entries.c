@@ -32,6 +32,11 @@ int recvAppendEntries(struct raft *r,
     int match;
     bool async;
     int rv;
+    int size = 0;
+
+    for (unsigned i = 0; i < args->n_entries; i++) {
+        size += args->entries[i].buf.len;
+    }
 
     assert(r != NULL);
     assert(id > 0);
@@ -121,6 +126,7 @@ int recvAppendEntries(struct raft *r,
     }
 
     if (async) {
+        r->profile.entries += size;
         return 0;
     }
 

@@ -70,6 +70,8 @@ int raft_init(struct raft *r,
         ErrMsgTransfer(r->io->errmsg, r->errmsg, "io");
         goto err_after_address_alloc;
     }
+    r->profile.entries = 0;
+    r->profile.snapshots = 0;
     return 0;
 
 err_after_address_alloc:
