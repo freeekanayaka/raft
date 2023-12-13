@@ -1,0 +1,794 @@
+RAFT_UPDATE_CURRENT_TERM;
+RAFT_UPDATE_VOTED_FOR;
+RAFT_UPDATE_ENTRIES;
+RAFT_UPDATE_SNAPSHOT;
+RAFT_UPDATE_MESSAGES;
+RAFT_UPDATE_STATE;
+RAFT_UPDATE_COMMIT_INDEX;
+RAFT_UPDATE_TIMEOUT;
+RAFT_UPDATE_LEADER;
+
+struct raft_update {
+   struct {
+      struct raft_message *batch;
+      unsigned n;
+   } messages;
+   struct {
+     raft_index index; /* 0 if no change */
+     struct raft_entry *batch;
+     unsigned n;
+   } entries;
+   struct {
+     struct raft_snapshot_metadata metadata;
+     size_t offset;
+     struct raft_buffer chunk;
+     bool last;
+   } snapshot;
+   struct {
+   } catch_up;
+   unsigned flags;
+}; /* size: 120 bytes (2 cache lines) */
+
+RAFT_API int raft_step(struct raft *r,
+                       const struct raft_event *event,
+                       struct raft_update *update);
+
+RAFT_PEER_TRANSFEREE  /* Leadership is currently being trasferred to this peer */
+RAFT_PEER_CATCHING_UP /* This peer is currently catching up with logs */
+RAFT_PEER_SLOW        /* This peer was catching up, but we gave up because it was too slow */
+RAFT_PEER_CAUGHT_UP   /* This peer has caught up with logs */
+
+int raft_peer(struct raft *r, raft_id id, int *flags);
+
+RAFT_TRANSFER_WAITING  /* Waiting for transferee's log to catch up */
+RAFT_TRANSFER_RUNNING  /* Sent TimeoutNow message */
+RAFT_TRANSFER_FINISHED /* Election timeout elapsed or leader stepped down */
+
+struct raft_transfer {
+    raft_id id;               /* ID of target server. */
+    raft_time start;          /* Start of leadership transfer. */
+    int status;
+}
+
+== Catch up
+
+- fire RAFT_CATCH_UP event
+- check int raft_catch_up(struct raft *r, raft_id server_id, int *status)
+
+== Leadership transfer
+
+- fire RAFT_TRANSFER event
+- check raft_transferee()
+- if raft_transferee() is 0, check if raft_leader() == requested ID
+
+== Eager apply
+
+https://github.com/canonical/raft/pull/465
+
+== snapshot restore
+
+0. receive RAFT_INSTALL_SNAPSHOT message with non-last chunk, this does not change raft's engine state
+1. receive RAFT_INSTALL_SNAPSHOT message with last chunk
+2. adjust in-memory log metadata immediately to match snapshot, commit_index updated accordingly, last_stored stays the same
+3. start task RAFT_PERSIST_SNAPSHOT
+5. user code notices that commit_index is new but does not have associated entries, so it restores snapshot.
+
+== process RAFT_PERSIST_ENTRIES and RAFT_PERSIST_SNAPSHOT
+
+example concurrent persist entries:
+
+RAFT_PERSIST_ENTRIES 1: E1 E2 E3 E4 E5
+RAFT_PERSIST_ENTRIES 2:       E3 E4
+
+implementation must:
+
+1. persist E1 - E5
+2. truncate E3 to E5
+3. discard notification of completion of E5
+4. persist E3 - E4
+5. report completion of E5
+
+== total decouple from user fsm
+
+- entries:
+
+RAFT_API int raft_step(struct raft *r,
+                       const struct raft_event *event,
+                       raft_index *commit_index,
+                       raft_time *timeout,
+                       struct raft_task **tasks,
+                       unsigned *n_tasks);
+
+  user code keeps track of last_commit_index, and after calling raft_step()
+  it  must process all entries between last_commit_index and commit_index:
+
+  * if the an entry is RAFT_COMMAND -> apply to the fsm
+  * if the an entry is RAFT_BARRIER -> unblock waiters
+  * if the an entry is RAFT_CHANGE -> book keep the conf in order to include it in snapshots
+
+  if an entry is not available in the log it is guaranteed to be part of a
+  previously persisted snapshot, in that case the snapshot must be restored
+
+- take snapshot:
+
+  /* After having taken a FSM snapshot the user calls */
+  event.type = RAFT_SNAPSHOT;
+  event.snapshot.metadata = ...; /* Users must bookkeep last committed configuration */
+  event.snapshot.trailing = ...;
+  raft_step(r, event, ..)
+
+== apply entries
+
+replicationApply upon:
+- leaderPersistEntriesDone: in case quorum is reached for new entries
+- replicationUpdate (AppendEntries result): in case quorum is reached for new entries
+- followerPersistEntriesDone: in case quorum is reached for new entries
+- empty append entries: in case commit index has advanced
+
+== cowsql entry
+
+- metadata
+-
+
+== async truncation
+
+task.type = APPEND_ENTRIES; /* Some entries are referenced here */
+task.type = SEND_MESSAGE;   /* Some entries are referenced here */
+
+// entry E3(1) is being appended, its buffer is ion io_uring
+// entry E2(1) is being sent, its buffer is io_uring
+
+// truncation happens via APPEND_ENTRIES task with insert index equal or lower
+// than last one
+
+// entry E2(2) gets appended
+
+E1(1) --> E2(1) E3(1)
+      \-> E2(2)
+
+==
+
+struct raft {
+    struct raft_tracer *tracer; 8 bytes - 8 bytes
+    raft_id id;                 4 bytes
+    raft_term current_term;     4 bytes - 16 bytes
+    raft_time now;              8 bytes - 24 bytes
+    unsigned random;            4 bytes
+    unsigned char state;        1 byte
+    union {
+        struct {
+            unsigned char pre_vote : 1; bit
+        };
+        unsigned char[3] pad;
+    }                           3 bytes - 32 bytes
+    raft_id voted_for;          4 bytes
+    unsigned election_timeout;  4 bytes - 40 bytes /* could be in microseconds, not milliseconds */
+    unsigned heartbeat_timeout; 4 bytes            /* could be in microseconds, not milliseconds */
+    unsigned install_snapshot_timeout; 4 bytes - 48 bytes /* in milliseconds? */
+    raft_index commit_index;    8 bytes - 56 bytes
+    raft_index last_applied;    8 bytes - 64 bytes
+    raft_index last_stored;     8 bytes - 72 bytes
+    unsigned short max_catch_up_rounds; 2 bytes
+    unsigned short max_catch_up_round_duration; 2 bytes
+    unsigned char pad[4];       4 bytes - 80 bytes
+
+    union {
+        struct /* Follower */
+        {
+            unsigned randomized_election_timeout; 4 bytes /* Timer expiration. */
+            struct                                /* Current leader info. */
+            {
+                raft_id id;                       4 bytes
+            } current_leader;
+        } follower_state;                         8 bytes
+        struct
+        {
+            bool *votes;                          8 bytes /* Vote results. */
+            unsigned randomized_election_timeout; 4 bytes /* Timer expiration. */
+            union {
+                struct {
+                    bool disrupt_leader : 1;                  /* For leadership transfer */
+                    bool in_pre_vote :1;                     /* True in pre-vote phase. */
+                };
+                unsigned char pad[4];              4 bytes
+        } candidate_state;                        16 bytes;
+        struct
+        {
+            struct raft_progress *progress;        8 bytes /* Per-server replication state. */
+            struct raft_change *change;            8 bytes /* Pending membership change. */
+            raft_id promotee_id;                   4 bytes /* ID of server being promoted. */
+            unsigned short round_number;           2 bytes /* Current sync round. */
+            unsigned char pad[2];                  2 bytes
+            raft_index round_index;                8 bytes /* Target of the current round. */
+            raft_time round_start;                 8 bytes /* Start of current round. */
+        } leader_state;                           40 bytes
+    };                          40 bytes - 120 bytes
+
+    raft_index configuration_committed_index;   8 bytes - 128 bytes
+    raft_index configuration_uncommitted_index; 8 bytes - 136 bytes
+
+    unsigned short configuration_n_servers;                   2 bytes
+    unsigned short configuration_last_snapshot_n_servers;     2 bytes
+    unsigned char[4] pad;                                     4 bytes - 144 bytes
+
+    errmsg 48 bytes
+   /* within 3 cache lines - 192 bytes */
+
+    void *configuration_servers;                              8 * 32 = 256
+    void *configuration_last_snapshot_servers;                8 * 32 = 256  -  704 bytes
+
+    *progress;                                               64 * 32 = 2048 - 2752 bytes
+
+    struct raft_log *log;   /* Log entries. */               64 bytes       - 2816  bytes
+    *entries                                         16 * 2024 = 16384      - 19200 bytes
+    *tasks                                                   64 * 64 = 4096 - 23296 bytes
+};
+
+struct raft_server { 8 bytes
+    raft_id id; 32-bit;
+    unsigned char role; 8-bit;
+    unsigned char pad[3];
+}
+
+struct raft_progress
+{
+    raft_index next_index;        8 bytes -  8 bytes /* Next entry to send. */
+    raft_index match_index;       8 bytes - 16 bytes /* Highest index reported as replicated. */
+    raft_index snapshot_index;    8 bytes - 24 bytes /* Last index of most recent snapshot sent. */
+    raft_time last_send;          8 bytes - 32 bytes /* Timestamp of last AppendEntries RPC. */
+    raft_time snapshot_last_send; 8 bytes - 40 bytes /* Timestamp of last InstallSnaphot RPC. */
+    unsigned char state;          1 bytes /* Probe, pipeline or snapshot. */
+    bool recent_recv;             1 bytes /* A msg was received within election timeout. */
+    raft_flags features;          4 bytes - 48 bytes /* What the server is capable of. */
+    unsigned long pad[2];        16 bytes - 64 bytes
+}; // 64 bytes, one cache line
+
+struct raft_log
+{
+    raft_index offset;           8 bytes -  8 bytes /* Index of first entry is offset+1. */
+    size_t front, back;          8 bytes - 16 bytes /* Indexes of used slots [front, back). */
+    unsigned size;               4 bytes            /* Number of available slots in the buffer. */
+    unsigned refs_size;          4 bytes - 24 bytes /* Size of the reference counts hash table. */
+    struct raft_entry *entries;  8 bytes - 32 bytes /* Circular buffer of log entries. */
+    struct raft_entry_ref *refs; 8 bytes - 40 bytes /* Log entries reference counts hash table. */
+    struct                       /* Information about last snapshot, or zero. */
+    {
+        raft_index last_index; /* Snapshot replaces all entries up to here. */
+        raft_term last_term;   /* Term of last index. */
+    } snapshot;                 16 bytes - 56 bytes
+    unsigned long pad;           8 bytes - 64 bytes
+}; // 64 bytes, one cache line
+
+struct raft_entry
+{
+    raft_term term;         4 bytes /* Term in which the entry was created. */
+    unsigned short type;    1 bytes /* Type (FSM command, barrier, config change). */
+    void *data;             8 bytes
+}; 16 bytes
+
+==
+
+    RAFT_SEND_MESSAGE = 1, /* raft_step() sends at most one message per server */
+    RAFT_PERSIST_ENTRIES   /* raft_step() generates at most one persist entries */
+    RAFT_PERSIST_TERM_AND_VOTE  /* raft_step() generates at most one persist term/vote */
+    RAFT_LOAD_SNAPSHOT  /* raft_step() generates at most one load snapshot */
+    RAFT_APPLY_COMMANDS  /* raft_step() generates at most one apply commands */
+    RAFT_TAKE_SNAPSHOT  /* raft_step() generates at most one apply commands */
+    RAFT_RESTORE_SNAPSHOT  /* raft_step() generates at most one apply commands */
+==
+
+/**
+ * Tell the given struct raft instance what the current time is.
+ *
+ * The implementation of the core struct raft engine is fully deterministic and
+ * does not make any system call. Users should use raft_clock() to let the given
+ * struct raft know that the current time has changed.
+ *
+ * For example, if you drive struct raft using an event loop you should
+ * typically call raft_clock() just before the loop starts and then every time
+ * the loop wakes up after it has blocked waiting for I/O, timers or other types
+ * of events.
+ */
+RAFT_API void raft_clock(struct raft *r, raft_time now);
+
+==
+
+struct IoEntry {
+    int fd;
+}
+
+struct raft_io {
+    get(struct IoEntry *entry);
+    submit(); /* Submit everything that was pulled with entry() */
+    peek();
+    notifier();
+};
+
+UvWriterInit(int backend);
+
+e = UvWriterEntry(...)
+
+UvWriterSubmit(e1, e1, ...)
+
+e = UvWriterPeek(...)
+
+UvWriterSeen(e)
+
+typedef void (*UvWriterNotify)(struct UvWriter *w);
+
+==
+
+raft_tick()    /* timer expired */
+raft_poll()    /* I/O started */
+raft_done()    /* I/O completed */
+raft_receive() /* message received */
+
+enum {
+  RAFT_METRIC_MESSAGE_APPEND_ENTRIES_SEND_TOTAL = 1,
+  RAFT_METRIC_MESSAGE_APPEND_ENTRIES_RECV_TOTAL,
+  RAFT_METRIC_STATE_FOLLOWER_TOTAL,
+  RAFT_METRIC_STATE_CANDIDATE_TOTAL,
+  RAFT_METRIC_STATE_LEADER_TOTAL,
+}
+
+enum {
+  RAFT_UV_METRIC_SEGMENT_WRITE_DURATION = 0, /* Type: histogram Unit: milliseconds  */
+  RAFT_UV_METRIC_SEGMENT_WRITE_SIZE, /* Type: histogram Unit: bytes  */
+  RAFT_UV_METRIC_SEGMENT_WRITE_TOTAL, /* Type: counter */
+}
+
+struct raft_metric {
+    int code;
+    int type;
+    union {
+        unsigned long counter;
+        long gauge;
+        struct {
+          int resolution;
+        } histogram;
+    };
+}
+
+int raft_metric_init(struct raft_metric *m, int code, int type);
+
+void raft_metric_close(struct raft_metric *m);
+
+int raft_uv_monitoring(struct raft_io *io, struct raft_metric *metrics[], unsigned *n);
+
+void raft_uv_set_metric(struct raft_io *io, int code, bool enable);
+
+void raft_uv_set_metric(struct raft_io *io, int code, void *metric);
+
+int raft_monitor(struct raft *r, raft_queue *metrics);
+
+int raft_set_monitoring(struct raft *r, int metrics);
+
+struct raft_event {
+    int version;
+    time_t time;
+    enum raft_event_type type;
+    union {
+        struct {
+            raft_term term;
+            raft_id voted_for;
+            struct raft_snapshot_metadata *metadata;
+            raft_index strat_index;
+            struct raft_entry *entries;
+            unsigned n_entries;
+        } start;
+        struct {
+            raft_id id;
+            const char *address;
+            struct raft_message *message;
+        } receive;
+        struct {
+            struct raft_task *task;
+            int status;
+        } done;
+        struct {
+        } submit;
+    };
+}
+
+int raft_step(struct raft *r,
+              struct raft_event *event,
+              raft_time *timeout,
+              raft_task **tasks
+              unsigned *n_tasks)
+
+/* consumer */
+events;
+i = 0;
+n = 1;
+while (n > 0) {
+    event = &events[i + n - 1];
+    i++;
+    n--;
+    raft_step(event);
+    schedule(timeout);
+    for (i = 0; i < n_tasks; i++) {
+         bool done;
+         execute(task, &done);
+         if (done) {
+            event = pushEvent(events, i + n);
+            event.type = ...;
+            n++;
+        }
+    }
+}
+
+====
+
+int raft_load(struct raft *r,
+              raft_term term,
+              raft_id voted_for,
+              struct raft_snapshot_metadata *metadata,
+              raft_index start_index,
+              struct raft_entry *entries,
+              unsigned n_entries);
+
+struct raft_event {
+  enum raft_event_type type;
+  union {
+  struct { /* CONVERT */
+    emum raft_state_type old;
+    emum raft_state_type new;
+  };
+  struct { /* COMMIT */
+    raft_index index;
+  };
+  struct { /* SNAPSHOT_RECEIVED */
+    struct raft_buffer data;
+  };
+  }
+}
+
+/* libuv */
+int uv_raft_init(uv_loop_t *loop, struct uv_raft_t *uv, const char *dir);
+
+int uv_raft_load(struct uv_raft *uv,
+                 raft_term *term,
+                 raft_id *voted_for,
+                 struct raft_snapshot *snapshot,
+                 raft_index *start_index,
+                 struct raft_entry **entries,
+                 unsigned *n_entries)
+
+uv_raft_compact(uv_raft_t *r, const struct uv_buf_t bufs[], unsigned n)
+
+=== example ===
+
+struct uv_loop_t loop;
+struct raft raft;
+struct uv_raft_t driver;
+raft_init(&raft, 1, "1");
+const char *dir = "/tmp/raft";
+uv_raft_init(&loop, &driver, &raft, dir);
+uv_raft_start(&driver, &snapshot);
+ /* user FSM should restore snapshot */
+uv_run()
+
+/* client register handler */
+if not leader:
+    send failure response
+encode register command to &entry
+raft_accept(&raft, &entry, 1);
+push connection to register queue
+
+/* client request handler */
+if not leader:
+    send failure response
+encode client id, sequence, and command to &entry
+raft_accept(&raft, &entry, 1);
+push connection, client id and sequence to request queue
+
+/* check handle */
+if not leader (leadership lost):
+    drain request queue and send failure responses
+    possibly fail barrier
+    possibly fail change
+
+look at commit index and compare it to last applied to fsm
+for each unapplied commit:
+    if barrier:
+        if leader:
+            unblock barrier
+
+    if change:
+        if leader:
+            respond to client or internal callback (role management)
+
+    if register command:
+        deterministically allocate new session (log index ok)
+        if max sessions reached:
+            expire least recently used (according to log id)
+        if leader:
+            check register queue and possibly send success response
+        continue
+
+    if not valid client id:
+        if leader:
+            check request queue and possibly send failure response
+            continue
+    if new (client id, sequence) pair:
+        apply to fsm and cache result
+    if leader
+        check request queue and possibly send success response
+
+====== SNAPSHOT ======
+
+- taking a snapshot is async by default: user must check if a snapshot
+  must be started, in the same way it checks if an entry must be applied
+  (should it be done using the raft_io_persist_snapshot request?, maybe
+   not)
+
+- send INSTALL_SNAPSHOT message: the user needs to load last snapshot
+  and fill the missing data field with the relevant chunk
+
+- recv INSTALL_SNAPSHOT message: after the initial raft_recv() call, the user
+  must take care of telling raft that it has completed receiving and persisting
+  the snapshot (equivalent of installSnapshotCb). This means that receiving
+  the snapshot in chunks is a possible choice of the user.
+
+todo: check 152132b (#191), 269ac8b (#195), f990519 (#357)
+  - instead of using last_stored for detecting if a snapshot install
+    is in progress, use snapshot.put + snapshot.pending.data == NULL
+  - consider reverting a3bc60b
+
+======= LOOP =========
+
+1. The loop concept of ‘now’ is updated. The event loop caches the current time
+   at the start of the event loop tick in order to reduce the number of
+   time-related system calls.
+
+2. If the loop is alive an iteration is started, otherwise the loop will exit
+   immediately. So, when is a loop considered to be alive? If a loop has active
+   and ref’d handles, active requests or closing handles it’s considered to be
+   alive.
+
+3. Due timers are run. All active timers scheduled for a time before the loop’s
+   concept of now get their callbacks called.
+
+// for timeout timer, call raft_timer()
+// -> might enqueue messages (will be processed in prepare phase)
+// -> might change state (will be processed in prepare phase)
+// -> might change timeout (will be processed in prepare phase)
+// -> cant commit new entries
+
+4. Pending callbacks are called. All I/O callbacks are called right after
+   polling for I/O, for the most part. There are cases, however, in which
+   calling such a callback is deferred for the next loop iteration. If the
+   previous iteration deferred any I/O callback it will be run at this point.
+
+// pending callbacks are effectively only write callbacks which get delayed,
+// even if they complete immediately (because the socket buffer isn't full)
+
+// -> might call raft_done() for sent messages
+// -> no other side effect
+
+5. Idle handle callbacks are called. Despite the unfortunate name, idle handles
+   are run on every loop iteration, if they are active.
+
+6. Prepare handle callbacks are called. Prepare handles get their callbacks
+   called right before the loop will block for I/O.
+
+// if state changed -> trigger state_cb
+// if apply index is behind commit index -> trigger apply_cb
+// consume raft_pending() -> trigger relevant send/append (and possibly synchronous vote/term persist)
+
+7. Poll timeout is calculated. Before blocking for I/O the loop calculates for
+   how long it should block. These are the rules when calculating the timeout:
+
+            If the loop was run with the UV_RUN_NOWAIT flag, the timeout is 0.
+            If the loop is going to be stopped (uv_stop() was called), the timeout is 0.
+            If there are no active handles or requests, the timeout is 0.
+            If there are any idle handles active, the timeout is 0.
+            If there are any handles pending to be closed, the timeout is 0.
+            If none of the above cases matches, the timeout of the closest timer is taken, or if there are no active timers, infinity.
+
+8. The loop blocks for I/O. At this point the loop will block for I/O for the
+   duration calculated in the previous step. All I/O related handles that were
+   monitoring a given file descriptor for a read or write operation get their
+   callbacks called at this point.
+
+// if message received -> call raft_recv()
+//   -> might change state, timeout, commitment and enqueue messages
+// if message sent or entries appended -> call raft_done()
+//   -> might change commitment and enqueue messages
+
+9. Check handle callbacks are called. Check handles get their callbacks called
+   right after the loop has blocked for I/O. Check handles are essentially the
+   counterpart of prepare handles.
+
+// check the complete io queue, fire raft_done() accordingly
+// check the recv queue, fire raft_recv() accordingly (and possibly restore_cb for INSTALL_SNAPSHOT)
+// check which user callbacks can be fired (apply_cb, state_cb)
+// update timer
+
+// (consume pending I/O not necessary, next loop step)
+
+10. Close callbacks are called. If a handle was closed by calling uv_close() it
+    will get the close callback called.
+
+11. Special case in case the loop was run with UV_RUN_ONCE, as it implies
+    forward progress. It’s possible that no I/O callbacks were fired after
+    blocking for I/O, but some time has passed so there might be timers which
+    are due, those timers get their callbacks called.
+
+12. Iteration ends. If the loop was run with UV_RUN_NOWAIT or UV_RUN_ONCE modes
+    the iteration ends and uv_run() will return. If the loop was run with
+    UV_RUN_DEFAULT it will continue from the start if it’s still alive,
+    otherwise it will also end.
+
+=== dqlite ===
+
+// put EXEC_SQL or EXEC request in a queue, must contain client ID and request
+// sequence
+raft_accept(&l->raft, &entry, 1);
+
+apply_cb() {
+  // decode entry and check client ID and request sequence
+  // if result for that request in session cache, don't apply
+  // if request in queue, send result
+  fsm_apply()
+  // send queued messages
+}
+
+restore_cb() {
+  fsm_restore()
+}
+
+leadership_lost() {
+}
+
+
+==
+
+ioSend()
+
+- connected client ?
+  - yes: uv_write()
+  - no:  push to pending
+
+- writeCb -> call raft_done()
+  - if status != 0 && !already_closing -> close_stream
+
+- clientPrepareCb
+  - if stream == NULL && !no_timer
+
+== Store
+
+enum raft_store_io_type {
+    RAFT_STORE_ALLOCATE_FILE = 0,
+}
+
+#define RAFT_STORE_IO_FIELDS      \
+    enum raft_store_io_type type; \
+    void *queue[2]
+
+typedef raft_store_fd;
+
+struct raft_store_io;
+{
+    RAFT_WAL_IO_FIELDS;
+};
+
+struct raft_store_allocate {
+    RAFT_WAL_IO_FIELDS;
+    unsigned long long counter;
+    size_t size;
+    raft_wal_fd fd;
+}
+
+/* remove if size is 0, otherwise truncate and rename */
+struct raft_store_finalize {
+    RAFT_WAL_IO_FIELDS;
+    unsigned long long counter;
+    raft_index first_index;
+    raft_index last_index;
+    size_t size;
+    raft_store_fd fd;
+}
+
+struct raft_store_write {
+    RAFT_WAL_IO_FIELDS;
+    raft_wal_fd fd;
+    const raft_buf bufs;
+    unsigned n;
+    size_t offset;
+}
+
+struct raft_store_truncate {
+    RAFT_WAL_IO_FIELDS;
+    raft_index index;
+}
+
+struct raft_store;
+
+/* load:
+ *
+ * metadata -> read metadata1 and metadata2
+ * snapshot -> read latest .meta and data file
+ * segments -> read files, load entries, finalize leftover open
+ */
+
+/* prepare segment:
+ *
+ * - allocate file and return file descriptor
+ */
+
+/* truncate
+ *
+ * - finalize open segments
+ * - find segment to truncate
+ * - if truncation point in the middle -> create new segment
+ * - remove segment to truncate and all the ones after it
+ */
+
+/* append entry
+ *
+ * - asynchronos write with fd
+ */
+
+/* finalize segment:
+ *
+ * - remove if size is zero
+ * - truncate and rename
+ */
+
+/* persist snapshot
+ *
+ * - write both the metadata and snapshot file
+ * - remove old segments and snapshots
+ */
+
+
+enum raft_backend_io_type {
+  RAFT_BACKEND_READ,
+  RAFT_BACKEND_TRUNCATE_AND_RENAME,
+  RAFT_BACKEND_DELETE
+}
+
+struct raft_backend_io {
+  enum raft_backend_io_type type;
+  int status;
+  union {
+  struct { /* READ */
+    char[N] filename;
+    struct raft_buffer data;
+  }
+  struct { /* TRUNCATE_AND_RENAME */
+    char[N] filename;
+    char[N] *new_filename;
+    size_t size;
+    };
+  };
+}
+
+struct raft_backend_event {
+  enum raft_backend_io_event type;
+  union {
+  struct { /* MESSAGE_RECEIVED */
+    raft_id id;
+    const char *address;
+    struct raft_message message;
+  };
+  struct { /* IO_COMPLETED */
+    struct raft_io *io;
+  }
+}
+
+int raft_backend_init()
+const char *raft_backend_errmsg()
+
+int raft_backend_start(struct raft_backend *b);
+
+struct raft_backend_io *raft_backend_pending();
+
+int raft_backend_done(struct raft_backend *b, struct raft_backend_io *io);
+
+int raft_backend_submit(struct raft_backend *b, struct raft_io *io);
+
+int raft_backend_accept(struct raft_backend *b, raft_id id, const char *address, void *conn);
+
+struct raft_backend_event *raft_backend_poll(struct raft_backend *b);
