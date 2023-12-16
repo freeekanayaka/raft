@@ -24,8 +24,6 @@ struct raft_update {
      struct raft_buffer chunk;
      bool last;
    } snapshot;
-   struct {
-   } catch_up;
    unsigned flags;
 }; /* size: 120 bytes (2 cache lines) */
 
@@ -33,27 +31,12 @@ RAFT_API int raft_step(struct raft *r,
                        const struct raft_event *event,
                        struct raft_update *update);
 
-RAFT_PEER_TRANSFEREE  /* Leadership is currently being trasferred to this peer */
-RAFT_PEER_CATCHING_UP /* This peer is currently catching up with logs */
-RAFT_PEER_SLOW        /* This peer was catching up, but we gave up because it was too slow */
-RAFT_PEER_CAUGHT_UP   /* This peer has caught up with logs */
-
-int raft_peer(struct raft *r, raft_id id, int *flags);
-
-RAFT_TRANSFER_WAITING  /* Waiting for transferee's log to catch up */
-RAFT_TRANSFER_RUNNING  /* Sent TimeoutNow message */
-RAFT_TRANSFER_FINISHED /* Election timeout elapsed or leader stepped down */
-
-struct raft_transfer {
-    raft_id id;               /* ID of target server. */
-    raft_time start;          /* Start of leadership transfer. */
-    int status;
-}
-
 == Catch up
 
 - fire RAFT_CATCH_UP event
-- check int raft_catch_up(struct raft *r, raft_id server_id, int *status)
+- check int raft_catch_up(struct raft *r, raft_id id, int *status)
+
+status == RAFT_CATCH_UP_NONE | RAFT_CATCH_UP_RUNNING | RAFT_CATCH_UP_ABORTED | RAFT_CATCH_UP_FINISHED
 
 == Leadership transfer
 
