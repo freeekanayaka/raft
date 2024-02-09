@@ -1,3 +1,44 @@
+struct uv_raft_s;
+
+int uv_raft_init(struct uv_loop_s *loop, struct uv_raft_s *handle, struct raft *raft);
+
+typedef void (*uv_raft_commit_cb)(struct uv_raft_s*, raft_index index, int type, struct uv_buf_s *data);
+typedef void (*uv_raft_install_cb)(struct uv_raft_s*, struct uv_buf_s *data);
+typedef void (*uv_raft_state_cb)(struct uv_raft_s*, int old_state, int new_state);
+
+typedef void (*uv_raft_transfer_cb)(struct uv_raft_s*, int status);
+typedef void (*uv_raft_catch_up_cb)(struct uv_raft_s*, int status);
+
+int uv_raft_start(
+             struct uv_raft_s *handle,
+             const char *dir,
+             uv_raft_commit_cb,
+             uv_raft_install_cb
+             uv_raft_state_cb);
+
+int uv_raft_submit(
+             struct uv_raft_s *handle,
+             int type,
+             struct uv_buf_s *data);
+
+int uv_raft_transfer(struct uv_raft_s *handle, raft_id id);
+
+int uv_raft_catch_up(struct uv_raft_s *handle, raft_id id);
+
+int uv_raft_snapshot(
+             struct uv_raft_s *handle,
+             struct uv_buf_s *data);
+
+= cowsql FSM =
+
+-> enqueue some data to submit as raft entry
+-> glue code pulls from submission queue and forward to raft
+-> glue code observes commit index and applies new commits to FSM
+-> enqueue snapshot to submit to raft
+-> glue code pulls snapshot and fires RAFT_SNAPSHOT event
+
+===
+
 RAFT_UPDATE_CURRENT_TERM;
 RAFT_UPDATE_VOTED_FOR;
 RAFT_UPDATE_ENTRIES;
