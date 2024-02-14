@@ -24,8 +24,8 @@ implementation, which was originally written by this library's author
 [himself](https://github.com/canonical/raft/commits?author=freeekanayaka) while
 working at Canonical.
 
-It is a **fully compatible drop-in replacement** of Canonical's version, at
-least up to v0.18.0.
+It is a **fully compatible drop-in replacement** of Canonical's version, at up
+to v0.18.1.
 
 License
 -------
