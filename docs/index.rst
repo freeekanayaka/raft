@@ -6,15 +6,23 @@ Production grade asynchronous C implementation of the Raft consensus protocol.
 Design
 ------
 
-The library a has modular design: its core part implements only the core Raft
-algorithm logic (no I/O and no system calls). On top of that, various drivers
-are provided that implement actual network communication and persistent data
-storage.
+The library a has modular design: its `core`_ part implements only the core Raft
+algorithm logic (no I/O and no system calls). This core part is designed to work
+well with asynchronous or non-blocking I/O engines (such as `libuv`_ and
+`io_uring`_), although it can be used in threaded or blocking contexts as well.
 
-The core part of the library is designed to work well with asynchronous or
-non-blocking I/O engines (such as `libuv`_ and `io_uring`_), although it can be
-used in threaded or blocking contexts as well.
+On top of the core part, various drivers are provided that implement actual
+network communication and persistent data storage:
 
+- `libuv driver`_
+- `io_uring driver`_
+
+Users will typically want to use one these stock drivers instead of rolling out
+their own one.
+
+.. _core: ./core.html
+.. _libuv driver: ./uv.html
+.. _io_uring driver: ./uring.html
 .. _libuv: http://libuv.org
 .. _io_uring: https://en.wikipedia.org/wiki/Io_uring
 
@@ -59,4 +67,6 @@ full `license`_ text.
 
    quick-start
    core
+   uv
+   uring
    disk-format
